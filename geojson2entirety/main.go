@@ -33,7 +33,10 @@ func writeBytesInt(n int64, f *os.File ) {
 }
 
 func string2Bytes(s string) ([]byte, int) {
-    return []byte(s), len([]byte(s))
+    b := []byte(s)
+    b = append(b, byte{0})
+    l := len(b)
+    return b, l
 }
 
 func check(err error) {
