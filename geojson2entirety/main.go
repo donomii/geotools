@@ -34,7 +34,7 @@ func writeBytesInt(n int64, f *os.File ) {
 
 func string2Bytes(s string) ([]byte, int) {
     b := []byte(s)
-    b = append(b, byte{0})
+    b = append(b, []byte{0}...)
     l := len(b)
     return b, l
 }
@@ -91,10 +91,12 @@ func main() {
             result := geojson.Container{}
             err = json.Unmarshal(accum, &result)
             check(err)
-            if result.Properties["name"] != nil {
+            if result.Properties["name"] != nil && len(result.Properties["name"].(string))>1 {
+	/*
                 //fmt.Println("Parsed: ", string2Bytes(result.Properties["name"].(string)))
                 //fmt.Printf("%s ", string2Bytes(result.Properties["name"].(string)))
                 str := result.Properties["name"].(string)
+		fmt.Println("Adding tag: ",str)
                 //str = strings.Replace(str, "\"", "\\\"", -1)
                 outBytes, blength := string2Bytes(str)
                 _, err = stringsFile.Write(outBytes)
@@ -107,7 +109,9 @@ func main() {
                 writeBytes(result.Geometry.Point[1], tagpointsFile)
                 writeBytesInt(0, indexFile)
                 writeBytesInt(0, tagcatFile)
+*/
             } else {
+		fmt.Println("Adding point without tag")
                 writeBytes(result.Geometry.Point[0], pointsFile)
                 writeBytes(result.Geometry.Point[1], pointsFile)
                 writeBytes(0, pointdataFile)
