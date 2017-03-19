@@ -142,7 +142,7 @@ func main() {
 
 				writeBytes(result.Geometry.Point[1]*60, tagpointsFile)
 				writeBytes(result.Geometry.Point[0]*-60, tagpointsFile)
-				writeBytesInt(0, indexFile)
+				writeBytesInt(count-1, indexFile)
 				writeBytesInt(0, tagcatFile)
 			} else {
 				//fmt.Println("Adding point without tag")
