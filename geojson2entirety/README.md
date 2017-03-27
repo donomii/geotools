@@ -10,7 +10,7 @@ Will create a set of entirety map files called "myMap", using the first 1000 poi
 ## Options
 
     --outFile mapName   Will create binary map files named mapName
-    --limit n           Will stop after converting /n/ points.  Omit --limit to convert the entire file
+    --limit n           Will stop after converting n points.  Omit --limit to convert the entire file
 
 ## Entirety
 
