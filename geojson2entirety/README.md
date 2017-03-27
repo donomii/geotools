@@ -3,7 +3,7 @@ Importer for the entirety maptool
 
 ## Use
 
-  cat data.geojson | geojson2entirety --outFile myMap --limit 1000
+    cat data.geojson | geojson2entirety --outFile myMap --limit 1000
 
 Will create a set of entirety map files called "myMap", using the first 1000 points from data.geojson
 
