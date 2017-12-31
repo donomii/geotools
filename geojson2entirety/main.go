@@ -70,7 +70,7 @@ func unpackJSON(accum []byte) (geojson.Container, error) {
 	return result, nil
 }
 
-func writeTag(str string, lat, long float64, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile *os.File, indexCount, offset int64) int64 {
+func writeTag(str string, long, lat float64, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile *os.File, indexCount, offset int64) int64 {
 
 	//fmt.Println("Parsed: ", string2Bytes(result.Properties["name"].(string)))
 	//fmt.Printf("%s ", string2Bytes(result.Properties["name"].(string)))
@@ -168,13 +168,13 @@ func main() {
 					count = count + 1
 					indexCount += 1
 					str := result.Properties["name"].(string)
-					offset += writeTag(str, result.Geometry.Point[1]*60, result.Geometry.Point[0]*-60, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile, indexCount, offset)
+					offset += writeTag(str, result.Geometry.Point[1]*-60, result.Geometry.Point[0]*60, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile, indexCount, offset)
 				} else {
 					if verbose {
 						fmt.Println("Adding point without tag at ", result.Geometry.Point)
 					}
-					writeBytes(result.Geometry.Point[1]*60, pointsFile)
-					writeBytes(result.Geometry.Point[0]*-60, pointsFile)
+					writeBytes(result.Geometry.Point[0]*60, pointsFile)
+					writeBytes(result.Geometry.Point[1]*-60, pointsFile)
 					writeBytes(0, pointdataFile)
 					writeBytes(0, pointdataFile)
 					writeBytes(0, pointdataFile)
