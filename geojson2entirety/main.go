@@ -100,6 +100,8 @@ var verbose bool
 func main() {
 	var mapName = flag.String("outFile", "default_map", "Name for map file")
 	var limit = flag.Int64("limit", -1, "Limit the number of records imported")
+	var pointsOnly = *flag.Bool("points", false, "Only save data point")
+	var tagsOnly = *flag.Bool("tags", false, "Only save tags(named points)")
 	verbose = *flag.Bool("verbose", false, "Print progress")
 	//var skip = flag.Int("skip", -1, "Skip every nth record")
 
@@ -168,16 +170,20 @@ func main() {
 					count = count + 1
 					indexCount += 1
 					str := result.Properties["name"].(string)
-					offset += writeTag(str, result.Geometry.Point[1]*-60, result.Geometry.Point[0]*60, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile, indexCount, offset)
-				} else {
-					if verbose {
-						fmt.Println("Adding point without tag at ", result.Geometry.Point)
+					if !pointsOnly {
+						offset += writeTag(str, result.Geometry.Point[1]*-60, result.Geometry.Point[0]*60, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile, indexCount, offset)
 					}
-					writeBytes(result.Geometry.Point[0]*60, pointsFile)
-					writeBytes(result.Geometry.Point[1]*-60, pointsFile)
-					writeBytes(0, pointdataFile)
-					writeBytes(0, pointdataFile)
-					writeBytes(0, pointdataFile)
+				} else {
+					if !tagsOnly {
+						if verbose {
+							fmt.Println("Adding point without tag at ", result.Geometry.Point)
+						}
+						writeBytes(result.Geometry.Point[0]*60, pointsFile)
+						writeBytes(result.Geometry.Point[1]*-60, pointsFile)
+						writeBytes(0, pointdataFile)
+						writeBytes(0, pointdataFile)
+						writeBytes(0, pointdataFile)
+					}
 				}
 				accum = []byte{}
 			} else {
