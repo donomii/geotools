@@ -1,3 +1,6 @@
+[![Build Status](https://travis-ci.org/donomii/geojson2entirety.svg?branch=master)](https://travis-ci.org/donomii/geojson2entirety)
+[![GoDoc](https://godoc.org/github.com/donomii/geojson2entirety?status.svg)](https://godoc.org/github.com/donomii/geojson2entirety)
+
 # geojson2entirety
 Importer for the entirety maptool
 
