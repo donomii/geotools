@@ -21,6 +21,6 @@ The Entirety maptool displays the planet, in its entirety.  Using data from mult
 
 ## Format
 
-Entirety geojson breaks the geojson standard in two small but important ways.  Entirety geojson omits the [] array brackets that usually surround the entire geojson file.  So instead of having one giant JSON array in the file, there are simply the array elements.
+Entirety geojson expects input in a slightly non-standard format.  Each element (each *feature*) must be on its own line, followed by a newline \n.  This allows the parser to easily resume after an error, and also makes the import (and generation) code much smaller and easier to write.
 
-In addition, each element (each *feature*) must be on its own line, followed by a newline \n.  This allows the parser to easily resume after an error, and also makes the import (and generation) code much smaller and easier to write.
+I plan to fix this in the future.
