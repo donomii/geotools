@@ -14,7 +14,7 @@ import (
 )
 import "flag"
 
-func writeBytes(n float64, f *os.File) {
+func writeBytes(n float64, f *bufio.Writer) {
 	buf := new(bytes.Buffer)
 	err := binary.Write(buf, binary.LittleEndian, n)
 	if err != nil {
@@ -24,7 +24,7 @@ func writeBytes(n float64, f *os.File) {
 	//fmt.Printf("%s", buf.Bytes())
 }
 
-func writeBytesInt(n int64, f *os.File) {
+func writeBytesInt(n int64, f *bufio.Writer) {
 	buf := new(bytes.Buffer)
 	err := binary.Write(buf, binary.LittleEndian, n)
 	if err != nil {
@@ -70,7 +70,7 @@ func unpackJSON(accum []byte) (geojson.Container, error) {
 	return result, nil
 }
 
-func writeTag(str string, long, lat float64, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile *os.File, indexCount, offset int64) int64 {
+func writeTag(str string, long, lat float64, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile *bufio.Writer, indexCount, offset int64) int64 {
 
 	//fmt.Println("Parsed: ", string2Bytes(result.Properties["name"].(string)))
 	//fmt.Printf("%s ", string2Bytes(result.Properties["name"].(string)))
@@ -97,6 +97,14 @@ func writeTag(str string, long, lat float64, tagpointsFile, offsetFile, indexFil
 
 var verbose bool
 
+func openFile(mapname string) (*os.File, *bufio.Writer) {
+	f, err := os.Create(mapname)
+	check(err)
+	//defer tagpointsFile.Close()
+	w := bufio.NewWriterSize(f, 10*1024*1024)
+	return f, w
+}
+
 func main() {
 	var mapName = flag.String("outFile", "default_map", "Name for map file")
 	var limit = flag.Int64("limit", -1, "Limit the number of records imported")
@@ -106,34 +114,48 @@ func main() {
 	//var skip = flag.Int("skip", -1, "Skip every nth record")
 
 	flag.Parse()
-	if *tagsOnly { log.Println("Not writing points") }
-	if *pointsOnly { log.Println("Not writing tags") }
+
+	if *tagsOnly {
+		log.Println("Not writing points")
+	}
+	if *pointsOnly {
+		log.Println("Not writing tags")
+	}
 	var err error
 	scanner := bufio.NewReader(os.Stdin)
-	tagpointsFile, err := os.Create(*mapName + ".tag_points")
-	check(err)
-	defer tagpointsFile.Close()
-	pointsFile, err := os.Create(*mapName + ".map_points")
-	check(err)
-	defer pointsFile.Close()
-	pointdataFile, err := os.Create(*mapName + ".map_data")
-	check(err)
-	defer pointdataFile.Close()
-	tagcatFile, err := os.Create(*mapName + ".tag_category")
-	check(err)
-	defer tagcatFile.Close()
-	preoffsetFile, err := os.Create(*mapName + ".pre_offset")
-	check(err)
-	defer preoffsetFile.Close()
-	offsetFile, err := os.Create(*mapName + ".tag_offset")
-	check(err)
-	defer offsetFile.Close()
-	stringsFile, err := os.Create(*mapName + ".tag_text")
-	check(err)
-	defer stringsFile.Close()
-	indexFile, err := os.Create(*mapName + ".tag_index")
-	check(err)
-	defer indexFile.Close()
+
+	tp_handle, tagpointsFile := openFile(*mapName + ".tag_points")
+	defer tagpointsFile.Flush()
+	defer tp_handle.Close()
+
+	pf_handle, pointsFile := openFile(*mapName + ".map_points")
+	defer pointsFile.Flush()
+	defer pf_handle.Close()
+
+	pd_handle, pointdataFile := openFile(*mapName + ".map_data")
+	defer pointdataFile.Flush()
+	defer pd_handle.Close()
+
+	tg_handle, tagcatFile := openFile(*mapName + ".tag_category")
+	defer tagcatFile.Flush()
+	defer tg_handle.Close()
+
+	po_handle, preoffsetFile := openFile(*mapName + ".pre_offset")
+	defer preoffsetFile.Flush()
+	defer po_handle.Close()
+
+	of_handle, offsetFile := openFile(*mapName + ".tag_offset")
+	defer offsetFile.Flush()
+	defer of_handle.Close()
+
+	str_handle, stringsFile := openFile(*mapName + ".tag_text")
+	defer stringsFile.Flush()
+	defer str_handle.Close()
+
+	in_handle, indexFile := openFile(*mapName + ".tag_index")
+	defer indexFile.Flush()
+	defer in_handle.Close()
+
 	line := []byte{}
 	more := false
 	accum := []byte{}
