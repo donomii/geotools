@@ -10,9 +10,10 @@ import (
 	"fmt"
 	"os"
 
+	"flag"
+
 	"github.com/jharlap/geojson"
 )
-import "flag"
 
 func writeBytes(n float64, f *bufio.Writer) {
 	buf := new(bytes.Buffer)
@@ -71,7 +72,7 @@ func unpackJSON(accum []byte) (geojson.Container, error) {
 }
 
 func writeTag(str string, long, lat float64, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile *bufio.Writer, indexCount, offset int64) int64 {
-
+	treeIndexAdd(str, long, lat)
 	//fmt.Println("Parsed: ", string2Bytes(result.Properties["name"].(string)))
 	//fmt.Printf("%s ", string2Bytes(result.Properties["name"].(string)))
 
@@ -121,6 +122,8 @@ func main() {
 	if *pointsOnly {
 		log.Println("Not writing tags")
 	}
+
+	log.Println("Reading from stdin")
 	var err error
 	scanner := bufio.NewReader(os.Stdin)
 
@@ -167,6 +170,7 @@ func main() {
 
 		line, more, err = scanner.ReadLine()
 		if err != nil {
+			buildFinal()
 			log.Printf("Imported %d records\n", count)
 			log.Println("Done.  Finished map: ", *mapName)
 			os.Exit(0)
@@ -177,11 +181,13 @@ func main() {
 		} else {
 			if *limit > -1 && count > *limit {
 				log.Printf("Finishing import early after %d records for %v", count, *mapName)
+				buildFinal()
 				os.Exit(0)
 			}
 
 			//accum = append(accum, line...)
 			//fmt.Printf("Line: %v\n", string(accum[:len(accum)]))
+			//log.Println("Unpacking", accum)
 			result, err := unpackJSON(accum)
 			check(err)
 			if err == nil {
@@ -215,6 +221,6 @@ func main() {
 			}
 		}
 	}
-
+	buildFinal()
 	log.Println("Job's a good'un, boss!")
 }
