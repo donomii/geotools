@@ -173,7 +173,7 @@ func main() {
 			buildFinal()
 			log.Printf("Imported %d records\n", count)
 			log.Println("Done.  Finished map: ", *mapName)
-			os.Exit(0)
+			break
 		}
 		accum = append(accum, line...)
 		if more {
@@ -208,6 +208,7 @@ func main() {
 						if verbose {
 							fmt.Println("Adding point without tag at ", result.Geometry.Point)
 						}
+						treeIndexAdd("", result.Geometry.Point[1]*-60, result.Geometry.Point[0]*60)
 						writeBytes(result.Geometry.Point[0]*60, pointsFile)
 						writeBytes(result.Geometry.Point[1]*-60, pointsFile)
 						writeBytes(0, pointdataFile)
@@ -222,5 +223,10 @@ func main() {
 		}
 	}
 	buildFinal()
+	//iterateMp(mp)
+	jsonString, err := json.MarshalIndent(mp, "", "  ")
+	fmt.Println(err)
+	fmt.Println(string(jsonString))
+	IterateMp(mp, func(lat, lon float64, data leaf) { fmt.Printf("lat: %v, lon: %v, data: %v\n", lat, lon, data) })
 	log.Println("Job's a good'un, boss!")
 }

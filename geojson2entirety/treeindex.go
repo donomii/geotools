@@ -39,7 +39,7 @@ func treeIndexAdd(str string, long, lat float64) {
 		m3.(map[int]interface{})[l3] = m4
 	}
 
-	m4.(map[int]interface{})[l4] = leaf{pos: int32(l4), text: str, latitude: lat, longitude: long}
+	m4.(map[int]interface{})[l4] = leaf{Pos: int32(l4), Text: str, Latitude: lat, Longitude: long}
 
 	log.Println("Added ", str)
 
@@ -51,19 +51,42 @@ func treeIndexAdd(str string, long, lat float64) {
 }
 
 func dumpMap(mp mapPack) {
-	for i1 := 0; i1 < len(mp.l1)-1; i1 += 1 {
-		m2start := mp.l1[i1].index
-		m2end := mp.l1[i1].index + 1
+	for i1 := 0; i1 < len(mp.L1)-1; i1 += 1 {
+		m2start := mp.L1[i1].Index
+		m2end := mp.L1[i1].Index + 1
 		//log.Printf("1. Dumping from %v to %v\n", m2start, m2end)
 		for i2 := m2start; i2 < m2end; i2 += 1 {
-			m3start := mp.l2[i2].index
-			m3end := mp.l2[i2].index + 1
+			m3start := mp.L2[i2].Index
+			m3end := mp.L2[i2].Index + 1
 			//			log.Printf("2. Dumping from %v to %v\n", m3start, m3end)
 			for i3 := m3start; i3 < m3end; i3 += 1 {
-				m4start := mp.l3[i3].index
-				m4end := mp.l3[i3].index + 1
+				m4start := mp.L3[i3].Index
+				m4end := mp.L3[i3].Index + 1
 				for i4 := m4start; i4 < m4end; i4 += 1 {
-					fmt.Printf("%v,%v,%v,%v - %v", mp.l1[i1].key, mp.l2[i2].key, mp.l3[i3].key, mp.l4[i4].pos, mp.l4[i4])
+					fmt.Printf("%v,%v - %v\n", float64(mp.L1[i1].Key)+float64(mp.L2[i2].Key)/1000000, float64(mp.L3[i3].Key)+float64(mp.L4[i4].Pos)/1000000, mp.L4[i4])
+				}
+
+			}
+
+		}
+	}
+}
+
+func IterateMp(mp mapPack, f func(float64, float64, leaf)) {
+	for i1 := 0; i1 < len(mp.L1)-1; i1 += 1 {
+		m2start := mp.L1[i1].Index
+		m2end := mp.L1[i1].Index + 1
+		//log.Printf("1. Dumping from %v to %v\n", m2start, m2end)
+		for i2 := m2start; i2 < m2end; i2 += 1 {
+			m3start := mp.L2[i2].Index
+			m3end := mp.L2[i2].Index + 1
+			//			log.Printf("2. Dumping from %v to %v\n", m3start, m3end)
+			for i3 := m3start; i3 < m3end; i3 += 1 {
+				m4start := mp.L3[i3].Index
+				m4end := mp.L3[i3].Index + 1
+				for i4 := m4start; i4 < m4end; i4 += 1 {
+					f(float64(mp.L1[i1].Key)+float64(mp.L2[i2].Key)/1000000, float64(mp.L3[i3].Key)+float64(mp.L4[i4].Pos)/1000000, mp.L4[i4])
+					//fmt.Printf(mp.l1[i1].key, mp.l2[i2].key, mp.l3[i3].key, mp.l4[i4].pos, mp.l4[i4])
 				}
 
 			}
@@ -73,19 +96,19 @@ func dumpMap(mp mapPack) {
 }
 
 type mapPack struct {
-	l1, l2, l3 []node
-	l4         []leaf
+	L1, L2, L3 []node
+	L4         []leaf
 }
 type node struct {
-	key   int32
-	index int32
+	Key   int32
+	Index int32
 }
 
 type leaf struct {
-	pos       int32
-	text      string
-	latitude  float64
-	longitude float64
+	Pos       int32
+	Text      string
+	Latitude  float64
+	Longitude float64
 }
 
 func buildFinal() {
@@ -137,10 +160,10 @@ func buildFinal() {
 	log.Printf("leafs %v\n", m4i)
 	*/
 
-	mp.l1 = m1i
-	mp.l2 = m2i
-	mp.l3 = m3i
-	mp.l4 = m4i
+	mp.L1 = m1i
+	mp.L2 = m2i
+	mp.L3 = m3i
+	mp.L4 = m4i
 
 	dumpMap(mp)
 }
