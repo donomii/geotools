@@ -2,6 +2,9 @@ package main
 
 import (
 	"log"
+
+	"github.com/tchap/go-patricia/patricia"
+
 	//"strings"
 	"bufio"
 	"bytes"
@@ -72,7 +75,7 @@ func unpackJSON(accum []byte) (geojson.Container, error) {
 }
 
 func writeTag(str string, long, lat float64, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile *bufio.Writer, indexCount, offset int64) int64 {
-	treeIndexAdd(str, long, lat)
+	treeIndexAdd2(str, long, lat)
 	//fmt.Println("Parsed: ", string2Bytes(result.Properties["name"].(string)))
 	//fmt.Printf("%s ", string2Bytes(result.Properties["name"].(string)))
 
@@ -208,7 +211,7 @@ func main() {
 						if verbose {
 							fmt.Println("Adding point without tag at ", result.Geometry.Point)
 						}
-						treeIndexAdd("", result.Geometry.Point[1]*-60, result.Geometry.Point[0]*60)
+						treeIndexAdd2("", result.Geometry.Point[1]*-60, result.Geometry.Point[0]*60)
 						writeBytes(result.Geometry.Point[0]*60, pointsFile)
 						writeBytes(result.Geometry.Point[1]*-60, pointsFile)
 						writeBytes(0, pointdataFile)
@@ -222,11 +225,14 @@ func main() {
 			}
 		}
 	}
-	buildFinal()
+	//buildFinal()
 	//iterateMp(mp)
 	jsonString, err := json.MarshalIndent(mp, "", "  ")
 	fmt.Println(err)
 	fmt.Println(string(jsonString))
-	IterateMp(mp, func(lat, lon float64, data leaf) { fmt.Printf("lat: %v, lon: %v, data: %v\n", lat, lon, data) })
+	tree2.Visit(func(prefix patricia.Prefix, item patricia.Item) error {
+		fmt.Printf("lat: %v, lon: %v, data: %v\n", string(prefix), string(prefix), string(item.(string)))
+		return nil
+	})
 	log.Println("Job's a good'un, boss!")
 }

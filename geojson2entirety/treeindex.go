@@ -4,11 +4,21 @@ import (
 	"fmt"
 	"log"
 	"sort"
+
+	"github.com/tchap/go-patricia/patricia"
 )
 
 var tree map[int]interface{}
+var tree2 *patricia.Trie
 var mp mapPack
 
+func treeIndexAdd2(str string, long, lat float64) {
+	if tree2 == nil {
+		tree2 = patricia.NewTrie()
+	}
+	key := fmt.Sprintf("%v%v", long, lat)
+	tree2.Insert(patricia.Prefix(key), patricia.Item(str))
+}
 func treeIndexAdd(str string, long, lat float64) {
 
 	if tree == nil {
