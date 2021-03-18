@@ -3,7 +3,7 @@ package main
 import (
 	"log"
 
-	"github.com/tchap/go-patricia/patricia"
+	//"github.com/tchap/go-patricia/patricia"
 
 	//"strings"
 	"bufio"
@@ -75,7 +75,7 @@ func unpackJSON(accum []byte) (geojson.Container, error) {
 }
 
 func writeTag(str string, long, lat float64, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile *bufio.Writer, indexCount, offset int64) int64 {
-	treeIndexAdd2(str, long, lat)
+	//treeIndexAdd2(str, long, lat)
 	//fmt.Println("Parsed: ", string2Bytes(result.Properties["name"].(string)))
 	//fmt.Printf("%s ", string2Bytes(result.Properties["name"].(string)))
 
@@ -204,16 +204,16 @@ func main() {
 					indexCount += 1
 					str := result.Properties["name"].(string)
 					if !*pointsOnly {
-						offset += writeTag(str, result.Geometry.Point[1]*-60, result.Geometry.Point[0]*60, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile, indexCount, offset)
+						offset += writeTag(str, result.Geometry.Point[0]*-60, result.Geometry.Point[1]*60, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile, indexCount, offset)
 					}
 				} else {
 					if !*tagsOnly {
 						if verbose {
 							fmt.Println("Adding point without tag at ", result.Geometry.Point)
 						}
-						treeIndexAdd2("", result.Geometry.Point[1]*-60, result.Geometry.Point[0]*60)
-						writeBytes(result.Geometry.Point[0]*60, pointsFile)
-						writeBytes(result.Geometry.Point[1]*-60, pointsFile)
+						//treeIndexAdd2("", result.Geometry.Point[1]*-60, result.Geometry.Point[0]*60)
+						writeBytes(result.Geometry.Point[1]*60, pointsFile)
+						writeBytes(result.Geometry.Point[0]*-60, pointsFile)
 						writeBytes(0, pointdataFile)
 						writeBytes(0, pointdataFile)
 						writeBytes(0, pointdataFile)
@@ -230,9 +230,9 @@ func main() {
 	jsonString, err := json.MarshalIndent(mp, "", "  ")
 	fmt.Println(err)
 	fmt.Println(string(jsonString))
-	tree2.Visit(func(prefix patricia.Prefix, item patricia.Item) error {
+	/*tree2.Visit(func(prefix patricia.Prefix, item patricia.Item) error {
 		fmt.Printf("lat: %v, lon: %v, data: %v\n", string(prefix), string(prefix), string(item.(string)))
 		return nil
-	})
+	})*/
 	log.Println("Job's a good'un, boss!")
 }
