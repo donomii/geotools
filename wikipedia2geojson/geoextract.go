@@ -28,7 +28,7 @@ var wg, errwg sync.WaitGroup
 func parsePageCoords(p *wikiparse.Page, cherr chan<- *wikiparse.Page) {
 	gl, err := wikiparse.ParseCoords(p.Revisions[0].Text)
 	if err == nil {
-		fmt.Printf("{ \"type\": \"Feature\", \"geometry\": { \"type\": \"Point\", \"coordinates\": [ %v, %v ] }, \"properties\": { \"name\": \"%q\" } }", gl.Lon, gl.Lat, p.Title)
+		fmt.Printf("{ \"type\": \"Feature\", \"geometry\": { \"type\": \"Point\", \"coordinates\": [ %v, %v ] }, \"properties\": { \"name\": %q } }", gl.Lon, gl.Lat, p.Title)
 		if strict {
 			fmt.Printf(",")
 		} else {
