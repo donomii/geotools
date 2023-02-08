@@ -22,18 +22,23 @@ var compression string
 var numWorkers int
 var parseCoords bool
 var strict bool
+var firstLine bool = true
 
 var wg, errwg sync.WaitGroup
 
 func parsePageCoords(p *wikiparse.Page, cherr chan<- *wikiparse.Page) {
 	gl, err := wikiparse.ParseCoords(p.Revisions[0].Text)
 	if err == nil {
-		fmt.Printf("{ \"type\": \"Feature\", \"geometry\": { \"type\": \"Point\", \"coordinates\": [ %v, %v ] }, \"properties\": { \"name\": %q } }", gl.Lon, gl.Lat, p.Title)
-		if strict {
-			fmt.Printf(",")
+		if firstLine {
+			firstLine = false
 		} else {
-			fmt.Printf("\n")
+			if strict {
+				fmt.Printf(",")
+			} else {
+				fmt.Printf("\n")
+			}
 		}
+		fmt.Printf("{ \"type\": \"Feature\", \"geometry\": { \"type\": \"Point\", \"coordinates\": [ %v, %v ] }, \"properties\": { \"name\": %q } }", gl.Lon, gl.Lat, p.Title)
 	} else {
 		if err != wikiparse.ErrNoCoordFound {
 			cherr <- p
