@@ -35,7 +35,7 @@ func writeBytesInt(n int64, f *bufio.Writer) {
 		log.Println("binary.Write failed:", err)
 	}
 	_, err = f.Write(buf.Bytes())
-	//fmt.Printf("%s", buf.Bytes())
+	fmt.Printf("%s", buf.Bytes())
 }
 
 func string2Bytes(s string) ([]byte, int) {
@@ -51,14 +51,14 @@ func check(err error) {
 	}
 }
 
-func checkJSONerr(err error, js []byte) {
+func checkJSONerr(err error, js string) {
 	if err != nil {
 		log.Println(err)
 		log.Println(string(js))
 	}
 }
 
-func unpackJSON(accum []byte) (geojson.Container, error) {
+func unpackJSON(accum string) (geojson.Container, error) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Println("Caught error in unpackJSON ", r)
@@ -66,7 +66,7 @@ func unpackJSON(accum []byte) (geojson.Container, error) {
 		}
 	}()
 	result := geojson.Container{}
-	err := json.Unmarshal(accum, &result)
+	err := json.Unmarshal([]byte(accum), &result)
 	checkJSONerr(err, accum)
 	if err != nil {
 		return geojson.Container{}, err
@@ -114,7 +114,7 @@ func main() {
 	var limit = flag.Int64("limit", -1, "Limit the number of records imported")
 	var pointsOnly = flag.Bool("points", false, "Only save data point")
 	var tagsOnly = flag.Bool("tags", false, "Only save tags(named points)")
-	verbose = *flag.Bool("verbose", false, "Print progress")
+	flag.BoolVar(&verbose, "verbose", false, "Print progress")
 	//var skip = flag.Int("skip", -1, "Skip every nth record")
 
 	flag.Parse()
@@ -127,112 +127,88 @@ func main() {
 	}
 
 	log.Println("Reading from stdin")
-	var err error
-	scanner := bufio.NewReader(os.Stdin)
+	scanner := bufio.NewScanner(os.Stdin)
 
 	tp_handle, tagpointsFile := openFile(*mapName + ".tag_points")
-	defer tagpointsFile.Flush()
-	defer tp_handle.Close()
 
 	pf_handle, pointsFile := openFile(*mapName + ".map_points")
-	defer pointsFile.Flush()
-	defer pf_handle.Close()
 
 	pd_handle, pointdataFile := openFile(*mapName + ".map_data")
-	defer pointdataFile.Flush()
-	defer pd_handle.Close()
 
 	tg_handle, tagcatFile := openFile(*mapName + ".tag_category")
-	defer tagcatFile.Flush()
-	defer tg_handle.Close()
 
 	po_handle, preoffsetFile := openFile(*mapName + ".pre_offset")
-	defer preoffsetFile.Flush()
-	defer po_handle.Close()
 
 	of_handle, offsetFile := openFile(*mapName + ".tag_offset")
-	defer offsetFile.Flush()
-	defer of_handle.Close()
 
 	str_handle, stringsFile := openFile(*mapName + ".tag_text")
-	defer stringsFile.Flush()
-	defer str_handle.Close()
 
 	in_handle, indexFile := openFile(*mapName + ".tag_index")
-	defer indexFile.Flush()
-	defer in_handle.Close()
 
-	line := []byte{}
-	more := false
-	accum := []byte{}
 	offset := int64(0)
 	count := int64(0)
 	indexCount := int64(0)
 	offset += writeTag("FAIL", -60000, -6000, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile, indexCount, offset)
-	for {
+	for scanner.Scan() {
 
-		line, more, err = scanner.ReadLine()
-		if err != nil {
-			buildFinal()
-			log.Printf("Imported %d records\n", count)
-			log.Println("Done.  Finished map: ", *mapName)
+		line := scanner.Text()
+		if *limit > -1 && count > *limit {
+			log.Printf("Finishing import early after %d records for %v", count, *mapName)
+			//buildFinal()
 			break
 		}
-		accum = append(accum, line...)
-		if more {
-			//accum = append(accum, line...)
-		} else {
-			if *limit > -1 && count > *limit {
-				log.Printf("Finishing import early after %d records for %v", count, *mapName)
-				buildFinal()
-				os.Exit(0)
-			}
+		//fmt.Println("Parsing line: ", line)
+		result, err := unpackJSON(line)
+		if err != nil {
+			log.Println("Error unpacking JSON: ", err)
+			log.Printf("Invalid json '%v'\n", string(line))
+		}
+		if err == nil {
 
-			//accum = append(accum, line...)
-			//fmt.Printf("Line: %v\n", string(accum[:len(accum)]))
-			//log.Println("Unpacking", accum)
-			result, err := unpackJSON(accum)
-			check(err)
-			if err == nil {
+			//Dump result struct
+			//fmt.Printf("%+v\n", result)
 
-				/*if *skip > -1 {
-				if count >= *skip {
-					count = 0
-				} else {*/
-				if result.Properties["name"] != nil && len(result.Properties["name"].(string)) > 1 {
-					count = count + 1
-					indexCount += 1
-					str := result.Properties["name"].(string)
-					if !*pointsOnly {
-						offset += writeTag(str, result.Geometry.Point[0]*-60, result.Geometry.Point[1]*60, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile, indexCount, offset)
+			if result.Properties["name"] != nil && len(result.Properties["name"].(string)) > 1 {
+				count = count + 1
+				str := result.Properties["name"].(string)
+				if !*pointsOnly {
+					indexCount = indexCount + 1
+					if verbose {
+						fmt.Printf("Adding tag %d: %s at %v, %v at offset %v\n", indexCount, str, result.Geometry.Point[0]*-60, result.Geometry.Point[1]*60, offset)
 					}
-				} else {
-					if !*tagsOnly {
-						if verbose {
-							fmt.Println("Adding point without tag at ", result.Geometry.Point)
-						}
-						//treeIndexAdd2("", result.Geometry.Point[1]*-60, result.Geometry.Point[0]*60)
-						writeBytes(result.Geometry.Point[1]*60, pointsFile)
-						writeBytes(result.Geometry.Point[0]*-60, pointsFile)
-						writeBytes(0, pointdataFile)
-						writeBytes(0, pointdataFile)
-						writeBytes(0, pointdataFile)
-					}
+					offset += writeTag(str, result.Geometry.Point[0]*-60, result.Geometry.Point[1]*60, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile, indexCount, offset)
 				}
-				accum = []byte{}
 			} else {
-				accum = []byte{}
+				if !*tagsOnly {
+					if verbose {
+						fmt.Println("Adding point without tag at ", result.Geometry.Point)
+					}
+					//treeIndexAdd2("", result.Geometry.Point[1]*-60, result.Geometry.Point[0]*60)
+					writeBytes(result.Geometry.Point[1]*60, pointsFile)
+					writeBytes(result.Geometry.Point[0]*-60, pointsFile)
+					writeBytes(0, pointdataFile)
+					writeBytes(0, pointdataFile)
+					writeBytes(0, pointdataFile)
+				}
 			}
 		}
 	}
+	tagpointsFile.Flush()
+	tp_handle.Close()
+	pointsFile.Flush()
+	pf_handle.Close()
+	pointdataFile.Flush()
+	pd_handle.Close()
+	tagcatFile.Flush()
+	tg_handle.Close()
+	preoffsetFile.Flush()
+	po_handle.Close()
+	offsetFile.Flush()
+	of_handle.Close()
+	stringsFile.Flush()
+	str_handle.Close()
+	indexFile.Flush()
+	in_handle.Close()
 	//buildFinal()
-	//iterateMp(mp)
-	jsonString, err := json.MarshalIndent(mp, "", "  ")
-	fmt.Println(err)
-	fmt.Println(string(jsonString))
-	/*tree2.Visit(func(prefix patricia.Prefix, item patricia.Item) error {
-		fmt.Printf("lat: %v, lon: %v, data: %v\n", string(prefix), string(prefix), string(item.(string)))
-		return nil
-	})*/
 	log.Println("Job's a good'un, boss!")
 }
