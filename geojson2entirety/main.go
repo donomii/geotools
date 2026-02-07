@@ -81,7 +81,7 @@ func writeTag(str string, long, lat float64, tagpointsFile, offsetFile, indexFil
 
 	//str = strings.Replace(str, "\"", "\\\"", -1)
 	if verbose {
-		log.Println("Adding tag ", indexCount, ": ", str, " at ", lat, ",", long, " at offset ", offset)
+		// log.Println("Adding tag ", indexCount, ": ", str, " at ", lat, ",", long, " at offset ", offset)
 	}
 	outBytes, blength := string2Bytes(str)
 	wrote, err := stringsFile.Write(outBytes)
@@ -174,14 +174,14 @@ func main() {
 				if !*pointsOnly {
 					indexCount = indexCount + 1
 					if verbose {
-						fmt.Printf("Adding tag %d: %s at %v, %v at offset %v\n", indexCount, str, result.Geometry.Point[0]*-60, result.Geometry.Point[1]*60, offset)
+						// fmt.Printf("Adding tag %d: %s at %v, %v at offset %v\n", indexCount, str, result.Geometry.Point[0]*-60, result.Geometry.Point[1]*60, offset)
 					}
 					offset += writeTag(str, result.Geometry.Point[0]*-60, result.Geometry.Point[1]*60, tagpointsFile, offsetFile, indexFile, tagcatFile, stringsFile, preoffsetFile, indexCount, offset)
 				}
 			} else {
 				if !*tagsOnly {
 					if verbose {
-						fmt.Println("Adding point without tag at ", result.Geometry.Point)
+						// fmt.Println("Adding point without tag at ", result.Geometry.Point)
 					}
 					//treeIndexAdd2("", result.Geometry.Point[1]*-60, result.Geometry.Point[0]*60)
 					writeBytes(result.Geometry.Point[1]*60, pointsFile)
