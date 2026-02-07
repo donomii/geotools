@@ -1,0 +1,6 @@
+github.com/donomii/goof v0.0.0-20241124064022-84f417f466df h1:E7wMk63HGHhk5wzNRDkwnckq1aFXDRXeZNfuJQf/NVE=
+github.com/donomii/goof v0.0.0-20241124064022-84f417f466df/go.mod h1:ZgIjtvUfBzQ+0aQmB+UWVb2fhB0HmbFwu76laXvZLAY=
+github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
+github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
+github.com/dustin/go-wikiparse v0.0.0-20250818020950-367bf091230b h1:EPCdcsnHWRA+Enws3VSc4TikLS5t5+cJ2pWTyP3JSsc=
+github.com/dustin/go-wikiparse v0.0.0-20250818020950-367bf091230b/go.mod h1:hS70ekJJZqlFkUYzgzCNoaVeRmOA/fX310r4BJAd+Wg=
