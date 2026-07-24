@@ -18,8 +18,10 @@ import (
 
 	geo "github.com/paulmach/go.geo"
 	"github.com/qedus/osmpbf"
+	"github.com/qedus/osmpbf/OSMPBF"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
+	"google.golang.org/protobuf/proto"
 )
 
 type settings struct {
@@ -105,6 +107,10 @@ func main() {
 	}
 	// open pbf file
 	file := openFile(config.PbfPath)
+	if err := validatePBFFraming(file); err != nil {
+		log.Fatalf("invalid PBF file %q: %v", config.PbfPath, err)
+	}
+	rewind(file)
 
 	// perform two passes over the file, on the first pass
 	// we record a bitmask of the interesting elements in the
@@ -170,6 +176,41 @@ func main() {
 	}
 	if err := file.Close(); err != nil {
 		log.Fatalf("failed to close PBF file %q: %v", config.PbfPath, err)
+	}
+}
+
+func validatePBFFraming(input io.Reader) error {
+	const maxBlobHeaderSize = 64 * 1024
+	blockNumber := 0
+	for {
+		var headerSize uint32
+		if err := binary.Read(input, binary.BigEndian, &headerSize); err == io.EOF {
+			if blockNumber == 0 {
+				return fmt.Errorf("file is empty")
+			}
+			return nil
+		} else if err != nil {
+			return fmt.Errorf("block %d has an incomplete four-byte header length: %w", blockNumber+1, err)
+		}
+		blockNumber++
+		if headerSize == 0 || headerSize > maxBlobHeaderSize {
+			return fmt.Errorf("block %d declares a %d-byte header; expected 1 to %d bytes", blockNumber, headerSize, maxBlobHeaderSize)
+		}
+		headerBytes := make([]byte, headerSize)
+		if _, err := io.ReadFull(input, headerBytes); err != nil {
+			return fmt.Errorf("block %d header is truncated: expected %d bytes: %w", blockNumber, headerSize, err)
+		}
+		var header OSMPBF.BlobHeader
+		if err := proto.Unmarshal(headerBytes, &header); err != nil {
+			return fmt.Errorf("block %d has an invalid BlobHeader: %w", blockNumber, err)
+		}
+		blobSize := header.GetDatasize()
+		if blobSize < 1 || blobSize > osmpbf.MaxBlobSize {
+			return fmt.Errorf("block %d declares a %d-byte blob; expected 1 to %d bytes", blockNumber, blobSize, osmpbf.MaxBlobSize)
+		}
+		if _, err := io.CopyN(io.Discard, input, int64(blobSize)); err != nil {
+			return fmt.Errorf("block %d blob is truncated: expected %d bytes: %w", blockNumber, blobSize, err)
+		}
 	}
 }
 

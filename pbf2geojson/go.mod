@@ -9,4 +9,5 @@ require (
 	github.com/stretchr/testify v1.7.0
 	github.com/syndtr/goleveldb v1.0.0
 	github.com/tmthrgd/go-popcount v0.0.0-20190904054823-afb1ace8b04f
+	google.golang.org/protobuf v1.26.0
 )

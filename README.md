@@ -233,7 +233,22 @@ Options:
 
 ## Verification
 
-Each program includes a local built-in check:
+Run the complete offline test suite:
+
+```sh
+./test_all.sh
+```
+
+The suite exercises the real conversion paths and checks:
+
+- PBF framing, tag expressions, LevelDB indexing, way denormalization, optional way nodes, strict output, and multipolygons with inner rings
+- OSM XML nodes, ways, multipolygons, nested relations, empty tags, missing references, strict output, and gzip output
+- MediaWiki XML parsing, real coordinate templates, worker ordering, malformed input, page limits, markup removal, and Unicode tokens
+- GeoJSONL, arrays, and FeatureCollections converted into all eight Entirety files, including byte-level float, integer, offset, string, point, and tag validation
+
+The reduced Vancouver records come from the repository's archived 2015 OpenStreetMap PBF fixture and the [OpenStreetMap API representation of way 23254060](https://api.openstreetmap.org/api/0.6/way/23254060/full). The Wikipedia samples use the page IDs, revision IDs, text, and coordinate templates from [Singapore](https://en.wikipedia.org/w/index.php?title=Singapore&action=raw) and the [Eiffel Tower](https://en.wikipedia.org/w/index.php?title=Eiffel_Tower&action=raw). These records are embedded in the tests, so the suite does not contact either service.
+
+Each program also includes a local built-in check:
 
 ```sh
 ./bin/pbf2json -test
@@ -253,4 +268,4 @@ go -C wikipedia2doc2vec test ./...
 go -C geojson2entirety test ./...
 ```
 
-The PBF end-to-end test additionally requires `pbf2geojson/test/fixtures/vancouver_canada.osm.pbf` with SHA-1 `c033bef77dcb88ceb8e224aa17c6fe388a217c98`. The test does not download this fixture.
+The separate legacy Node PBF end-to-end test requires `pbf2geojson/test/vancouver_canada.osm.pbf` with SHA-1 `c033bef77dcb88ceb8e224aa17c6fe388a217c98`. That optional test does not download the fixture.
