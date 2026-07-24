@@ -11,6 +11,9 @@ function generateParams(config) {
   if( config.hasOwnProperty( 'waynodes' ) ){
     flags.push( `--waynodes=${config.waynodes}` );
   }
+  if( config.hasOwnProperty( 'batch' ) ){
+    flags.push( `--batch=${config.batch}` );
+  }
 
   flags.push( config.file );
 

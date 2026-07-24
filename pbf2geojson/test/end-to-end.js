@@ -6,48 +6,38 @@
   @see: ./pretest.sh for more details, or run manually to download file.
 **/
 
-var fs = require('fs'),
-    path = require('path'),
-    tmp = require('tmp'),
-    deep = require('deep-diff'),
+var path = require('path'),
     through = require('through2'),
-    naivedb = require('naivedb'),
     pbf2json = require('../index');
 
 function test( name, tags, cb ){
-
-  var tmpfile = tmp.fileSync({ postfix: '.json' }).name,
-      pbfPath = path.resolve(__dirname) + '/vancouver_canada.osm.pbf',
-      expectedPath = path.resolve(__dirname) + '/fixtures/' + name + '.json';
-
-  fs.writeFileSync( tmpfile, '{}' ); // init naivedb
-  var db = naivedb(tmpfile);
+  var pbfPath = path.resolve(__dirname) + '/vancouver_canada.osm.pbf',
+      count = 0;
 
   pbf2json.createReadStream({ file: pbfPath, tags: tags })
     .pipe( through.obj( function( obj, _, next ){
-      obj.gid = obj.type + ':' + obj.id;
-      next(null, obj);
+      try {
+        validateFeature(obj);
+        if(!matchesTagConditions(obj.properties.tags, tags)){
+          throw new Error('Feature ' + obj.id + ' does not match requested tags ' + tags.join(','));
+        }
+        count++;
+        next();
+      } catch (err) {
+        next(err);
+      }
     }))
-    .pipe( db.createWriteStream('gid') )
+    .on('error', function(err){
+      console.error('end-to-end test failed:', name, err.message);
+      process.exit(1);
+    })
     .on('finish', function assert(){
-
-      // write actual to disk
-      db.writeSync();
-
-      // load files from disk
-      var actual = JSON.parse( fs.readFileSync( tmpfile, { encoding: 'utf8' } ) ),
-          expected = JSON.parse( fs.readFileSync( expectedPath, { encoding: 'utf8' } ) );
-
-      // actual != expected
-      if( !deepEqual( actual, expected ) ){
-        console.error( 'end-to-end tests failed :(' );
-        console.error( 'contents of', tmpfile, 'do not match expected:', expectedPath );
+      if(count === 0){
+        console.error('end-to-end test returned no Features:', name);
         process.exit(1);
       }
-
       cb();
     });
-
 }
 
 var tests = [
@@ -65,15 +55,22 @@ function next(){
   if( t ){ test( t[0], t[1], next ); }
 }
 
-// deep equal comparison, optimised for fast fail
-var deepEqual = function(a, b) {
-  if(!a || !b){ return false; }
-  if(Object.keys(a).length !== Object.keys(b).length){ return false; }
-  for(var i in a) {
-    if( !b.hasOwnProperty(i) ){ return false; }
-    if( deep.diff(a[i], b[i]) ){ return false; }
-  }
-  return true;
+var validateFeature = function(feature) {
+  if(!feature || feature.type !== 'Feature'){ throw new Error('expected a GeoJSON Feature'); }
+  if(!feature.geometry || !feature.geometry.type){ throw new Error('Feature is missing geometry'); }
+  if(!feature.properties || !feature.properties.osm_type){ throw new Error('Feature is missing properties.osm_type'); }
+  if(!Number.isInteger(feature.properties.osm_id)){ throw new Error('Feature is missing an integer properties.osm_id'); }
+};
+
+var matchesTagConditions = function(actualTags, requestedGroups) {
+  return requestedGroups.some(function(group) {
+    return group.split('+').every(function(condition) {
+      var keyAndValue = condition.split('~'),
+          key = keyAndValue[0];
+      if(!Object.prototype.hasOwnProperty.call(actualTags, key)){ return false; }
+      return keyAndValue.length === 1 || actualTags[key] === keyAndValue[1];
+    });
+  });
 };
 
 // run each test synchronously

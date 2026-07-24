@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
@@ -9,6 +11,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -16,58 +19,92 @@ import (
 	geo "github.com/paulmach/go.geo"
 	"github.com/qedus/osmpbf"
 	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/opt"
 )
 
 type settings struct {
-	PbfPath    string
-	LevedbPath string
-	Tags       map[string][]string
-	BatchSize  int
-	WayNodes   bool
+	PbfPath         string
+	LevedbPath      string
+	Tags            map[string][]string
+	BatchSize       int
+	WayNodes        bool
+	Strict          bool
+	RunBuiltInTests bool
 }
-
-var emptyLatLons = make([]map[string]string, 0)
 
 func getSettings() settings {
 
 	// command line flags
-	leveldbPath := flag.String("leveldb", "/tmp", "path to leveldb directory")
+	leveldbPath := flag.String("leveldb", "", "path to a new LevelDB directory; empty uses an isolated temporary directory")
 	tagList := flag.String("tags", "", "comma-separated list of valid tags, group AND conditions with a +")
 	batchSize := flag.Int("batch", 50000, "batch leveldb writes in batches of this size")
 	wayNodes := flag.Bool("waynodes", false, "should the lat/lons of nodes belonging to ways be printed")
+	strict := flag.Bool("strict", false, "emit one GeoJSON FeatureCollection instead of one Feature per line")
+	runBuiltInTests := flag.Bool("test", false, "run built-in tests and exit")
 
 	flag.Parse()
 	args := flag.Args()
 
+	if *runBuiltInTests {
+		return settings{RunBuiltInTests: true}
+	}
+
 	if len(args) < 1 {
 		log.Fatal("invalid args, you must specify a PBF file")
+	}
+	if len(args) > 1 {
+		log.Fatal("invalid args, expected exactly one PBF file")
 	}
 
 	// invalid tags
 	if len(*tagList) < 1 {
 		log.Fatal("Nothing to do, you must specify tags to match against")
 	}
+	if *batchSize < 1 {
+		log.Fatal("invalid batch size: expected an integer greater than zero")
+	}
 
 	// parse tag conditions
 	conditions := make(map[string][]string)
 	for _, group := range strings.Split(*tagList, ",") {
+		group = strings.TrimSpace(group)
+		if group == "" {
+			log.Fatal("invalid tags: empty OR group")
+		}
 		conditions[group] = strings.Split(group, "+")
 	}
 
-	// fmt.Print(conditions, len(conditions))
-	// os.Exit(1)
+	if *leveldbPath == "" {
+		tempRoot, err := os.MkdirTemp("", "pbf2geojson-leveldb-")
+		if err != nil {
+			log.Fatalf("failed to create temporary LevelDB directory: %v", err)
+		}
+		*leveldbPath = filepath.Join(tempRoot, "db")
+	}
 
-	return settings{args[0], *leveldbPath, conditions, *batchSize, *wayNodes}
+	return settings{
+		PbfPath:    args[0],
+		LevedbPath: *leveldbPath,
+		Tags:       conditions,
+		BatchSize:  *batchSize,
+		WayNodes:   *wayNodes,
+		Strict:     *strict,
+	}
 }
 
 func main() {
 
 	// configuration
 	config := getSettings()
-
+	if config.RunBuiltInTests {
+		if err := runBuiltInTests(); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("pbf2geojson built-in tests passed")
+		return
+	}
 	// open pbf file
 	file := openFile(config.PbfPath)
-	defer file.Close()
 
 	// perform two passes over the file, on the first pass
 	// we record a bitmask of the interesting elements in the
@@ -78,7 +115,6 @@ func main() {
 
 	// set up leveldb connection
 	var db = openLevelDB(config.LevedbPath)
-	defer db.Close()
 
 	// === first pass (indexing) ===
 	idxDecoder := osmpbf.NewDecoder(file)
@@ -88,40 +124,67 @@ func main() {
 	}
 
 	// index target IDs in bitmasks
-	index(idxDecoder, masks, config)
+	if err := index(idxDecoder, masks, config); err != nil {
+		log.Fatal(err)
+	}
 
-	// no-op if no relation members of type 'way' present in mask
-	if !masks.RelWays.Empty() {
-		// === potential second pass (indexing) to index members of relations ===
-		file.Seek(io.SeekStart, 0) // rewind file
-		idxRelationsDecoder := osmpbf.NewDecoder(file)
-		err = idxRelationsDecoder.Start(runtime.GOMAXPROCS(-1)) // use several goroutines for faster decoding
-		if err != nil {
-			log.Fatal(err)
+	// Expand nested relations and index the nodes used by their member ways.
+	if !masks.RelWays.Empty() || !masks.RelRelation.Empty() {
+		for {
+			relationCount := masks.RelRelation.Len()
+			rewind(file)
+			idxRelationsDecoder := osmpbf.NewDecoder(file)
+			err = idxRelationsDecoder.Start(runtime.GOMAXPROCS(-1)) // use several goroutines for faster decoding
+			if err != nil {
+				log.Fatal(err)
+			}
+			if err := indexRelationMembers(idxRelationsDecoder, masks, config); err != nil {
+				log.Fatal(err)
+			}
+			if masks.RelRelation.Len() == relationCount {
+				break
+			}
 		}
-
-		// index relation member IDs in bitmasks
-		indexRelationMembers(idxRelationsDecoder, masks, config)
 	}
 
 	// === final pass (printing json) ===
-	file.Seek(io.SeekStart, 0) // rewind file
+	rewind(file)
 	decoder := osmpbf.NewDecoder(file)
 	err = decoder.Start(runtime.GOMAXPROCS(-1)) // use several goroutines for faster decoding
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// print json
-	print(decoder, masks, db, config)
+	writer := newFeatureWriter(os.Stdout, config.Strict)
+	if err := writer.Start(); err != nil {
+		log.Fatal(err)
+	}
+	if err := print(decoder, masks, db, config, writer); err != nil {
+		log.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		log.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		log.Fatalf("failed to close LevelDB %q: %v", config.LevedbPath, err)
+	}
+	if err := file.Close(); err != nil {
+		log.Fatalf("failed to close PBF file %q: %v", config.PbfPath, err)
+	}
 }
 
-func index(d *osmpbf.Decoder, masks *BitmaskMap, config settings) {
+func rewind(file *os.File) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		log.Fatalf("failed to rewind PBF file %q: %v", file.Name(), err)
+	}
+}
+
+func index(d *osmpbf.Decoder, masks *BitmaskMap, config settings) error {
 	for {
 		if v, err := d.Decode(); err == io.EOF {
 			break
 		} else if err != nil {
-			log.Fatal(err)
+			return fmt.Errorf("failed to decode PBF during output pass: %w", err)
 		} else {
 			switch v := v.(type) {
 
@@ -140,42 +203,21 @@ func index(d *osmpbf.Decoder, masks *BitmaskMap, config settings) {
 
 			case *osmpbf.Relation:
 				if hasTags(v.Tags) && containsValidTags(v.Tags, config.Tags) {
-
-					// record a count of which type of members
-					// are present in the relation
-					var count = make(map[int]int64)
-					for _, member := range v.Members {
-						count[int(member.Type)]++
-					}
-
-					// skip relations which contain 0 ways
-					if count[1] == 0 {
-						continue
-					}
-
 					masks.Relations.Insert(v.ID)
-					for _, member := range v.Members {
-						switch member.Type {
-						case 0: // node
-							masks.RelNodes.Insert(member.ID)
-						case 1: // way
-							masks.RelWays.Insert(member.ID)
-						case 2: // relation
-							masks.RelRelation.Insert(member.ID)
-						}
-					}
+					indexRelation(v, masks)
 				}
 			}
 		}
 	}
+	return nil
 }
 
-func indexRelationMembers(d *osmpbf.Decoder, masks *BitmaskMap, config settings) {
+func indexRelationMembers(d *osmpbf.Decoder, masks *BitmaskMap, config settings) error {
 	for {
 		if v, err := d.Decode(); err == io.EOF {
 			break
 		} else if err != nil {
-			log.Fatal(err)
+			return fmt.Errorf("failed to decode PBF while indexing relation members: %w", err)
 		} else {
 			switch v := v.(type) {
 			case *osmpbf.Way:
@@ -184,34 +226,42 @@ func indexRelationMembers(d *osmpbf.Decoder, masks *BitmaskMap, config settings)
 						masks.RelNodes.Insert(nodeid)
 					}
 				}
-				// support for super-relations
-				// case *osmpbf.Relation:
-				// 	if masks.RelRelation.Has(v.ID) {
-				// 		for _, member := range v.Members {
-				// 			switch member.Type {
-				// 			case 0: // node
-				// 				masks.RelNodes.Insert(member.ID)
-				// 			case 1: // way
-				// 				masks.RelWays.Insert(member.ID)
-				// 			}
-				// 		}
-				// 	}
+			case *osmpbf.Relation:
+				if masks.RelRelation.Has(v.ID) {
+					indexRelation(v, masks)
+				}
 			}
+		}
+	}
+	return nil
+}
+
+func indexRelation(relation *osmpbf.Relation, masks *BitmaskMap) {
+	for _, member := range relation.Members {
+		switch member.Type {
+		case 0:
+			masks.RelNodes.Insert(member.ID)
+		case 1:
+			masks.RelWays.Insert(member.ID)
+		case 2:
+			masks.RelRelation.Insert(member.ID)
 		}
 	}
 }
 
-func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings) {
+func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings, writer *featureWriter) error {
 
 	batch := new(leveldb.Batch)
 	finishedNodes := false
 	finishedWays := false
+	relations := make(map[int64]*osmpbf.Relation)
+	selectedRelationIDs := make([]int64, 0)
 
 	for {
 		if v, err := d.Decode(); err == io.EOF {
 			break
 		} else if err != nil {
-			log.Fatal(err)
+			return fmt.Errorf("failed to decode PBF during output pass: %w", err)
 		} else {
 			switch v := v.(type) {
 
@@ -225,7 +275,7 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 
 					// write in batches
 					cacheQueueNode(batch, v)
-					if batch.Len() > config.BatchSize {
+					if batch.Len() >= config.BatchSize {
 						cacheFlush(db, batch, true)
 					}
 				}
@@ -236,7 +286,13 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 
 					// trim tags
 					v.Tags = trimTags(v.Tags)
-					onNode(v)
+					feature, err := newNodeFeature(v)
+					if err != nil {
+						return err
+					}
+					if err := writer.Write(feature); err != nil {
+						return err
+					}
 				}
 
 			case *osmpbf.Way:
@@ -248,7 +304,7 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 				// ----------------
 				if !finishedNodes {
 					finishedNodes = true
-					if batch.Len() > 1 {
+					if batch.Len() > 0 {
 						cacheFlush(db, batch, true)
 					}
 				}
@@ -261,7 +317,7 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 
 					// write in batches
 					cacheQueueWay(batch, v)
-					if batch.Len() > config.BatchSize {
+					if batch.Len() >= config.BatchSize {
 						cacheFlush(db, batch, true)
 					}
 				}
@@ -275,8 +331,10 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 
 					// skip ways which fail to denormalize
 					if err != nil {
-                        log.Printf("Failed to process way because: %v\n", err)
-						break
+						return fmt.Errorf("failed to denormalize way %d: %w", v.ID, err)
+					}
+					if len(latlons) == 0 {
+						return fmt.Errorf("failed to denormalize way %d: way has no node coordinates", v.ID)
 					}
 
 					// compute centroid
@@ -285,10 +343,12 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 					// trim tags
 					v.Tags = trimTags(v.Tags)
 
-					if config.WayNodes {
-						onWay(v, latlons, centroid, bounds)
-					} else {
-						onWay(v, emptyLatLons, centroid, bounds)
+					feature, err := newWayFeature(v, latlons, centroid, bounds, config.WayNodes)
+					if err != nil {
+						return err
+					}
+					if err := writer.Write(feature); err != nil {
+						return err
 					}
 				}
 
@@ -301,180 +361,462 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 				// ----------------
 				if !finishedWays {
 					finishedWays = true
-					if batch.Len() > 1 {
+					if batch.Len() > 0 {
 						cacheFlush(db, batch, true)
 					}
 				}
 
-				// bitmask indicates if this is a relation of interest
-				// if so, print it
-				if masks.Relations.Has(v.ID) {
-
-					// fetch all latlons for all ways in relation
-					var memberWayLatLons = findMemberWayLatLons(db, v)
-
-					// no ways found, skip relation
-					if len(memberWayLatLons) == 0 {
-						log.Println("[warn] denormalize failed for relation:", v.ID, "no ways found")
-						continue
+				if masks.Relations.Has(v.ID) || masks.RelRelation.Has(v.ID) {
+					relations[v.ID] = v
+					if masks.Relations.Has(v.ID) {
+						selectedRelationIDs = append(selectedRelationIDs, v.ID)
 					}
-
-					// best centroid and bounds to use
-					var largestArea = 0.0
-					var centroid map[string]string
-					var bounds *geo.Bound
-
-					// iterate over each way, selecting the largest way to use
-					// for the centroid and bbox
-					for _, latlons := range memberWayLatLons {
-
-						// compute centroid
-						wayCentroid, wayBounds := computeCentroidAndBounds(latlons)
-
-						// if for any reason we failed to find a valid bounds
-						if nil == wayBounds {
-							log.Println("[warn] failed to calculate bounds for relation member way")
-							continue
-						}
-
-						area := math.Max(wayBounds.GeoWidth(), 0.000001) * math.Max(wayBounds.GeoHeight(), 0.000001)
-
-						// find the way with the largest area
-						if area > largestArea {
-							largestArea = area
-							centroid = wayCentroid
-							bounds = wayBounds
-						}
-					}
-
-					// if for any reason we failed to find a valid bounds
-					if nil == bounds {
-						log.Println("[warn] denormalize failed for relation:", v.ID, "no valid bounds")
-						continue
-					}
-
-					// use 'admin_centre' node centroid where available
-					// note: only applies to 'boundary=administrative' relations
-					// see: https://github.com/pelias/pbf2json/pull/98
-					if v.Tags["boundary"] == "administrative" {
-						for _, member := range v.Members {
-							if member.Type == 0 && member.Role == "admin_centre" {
-								if latlons, err := cacheLookupNodeByID(db, member.ID); err == nil {
-									latlons["type"] = "admin_centre"
-									centroid = latlons
-									break
-								}
-							}
-						}
-					}
-
-					// trim tags
-					v.Tags = trimTags(v.Tags)
-
-					// print relation
-					onRelation(v, centroid, bounds)
 				}
 
 			default:
 
-				log.Fatalf("[error] unknown type %T\n", v)
+				return fmt.Errorf("unknown decoded PBF type %T", v)
 
 			}
 		}
 	}
-}
-
-// lookup all latlons for all ways in relation
-func findMemberWayLatLons(db *leveldb.DB, v *osmpbf.Relation) [][]map[string]string {
-	var memberWayLatLons [][]map[string]string
-
-	for _, mem := range v.Members {
-		if mem.Type == 1 {
-
-			// lookup from leveldb
-			latlons, err := cacheLookupWayNodes(db, mem.ID)
-
-			// skip way if it fails to denormalize
-			if err != nil {
-				break
-			}
-
-			memberWayLatLons = append(memberWayLatLons, latlons)
+	if batch.Len() > 0 {
+		cacheFlush(db, batch, true)
+	}
+	for _, relationID := range selectedRelationIDs {
+		feature, err := newRelationFeature(db, relations[relationID], relations)
+		if err != nil {
+			return err
+		}
+		if err := writer.Write(feature); err != nil {
+			return err
 		}
 	}
-
-	return memberWayLatLons
+	return nil
 }
 
-type jsonNode struct {
-	ID   int64             `json:"id"`
-	Type string            `json:"type"`
-	Lat  float64           `json:"lat"`
-	Lon  float64           `json:"lon"`
-	Tags map[string]string `json:"tags"`
+type geoJSONGeometry struct {
+	Type        string            `json:"type"`
+	Coordinates json.RawMessage   `json:"coordinates,omitempty"`
+	Geometries  []geoJSONGeometry `json:"geometries,omitempty"`
 }
 
-func format_tags(m map[string]string) string {
-    arr := []string{}
-    for k,v := range m {
-        key := strings.Replace(k, "\"", "\\\"", -1)
-        val := strings.Replace(v, "\"", "\\\"", -1)
-        arr = append(arr, fmt.Sprintf("\"%v\": \"%v\"", key, val))
-    }
-    return strings.Join(arr, ", ")
-}
-
-func onNode(node *osmpbf.Node) {
-	marshall := jsonNode{node.ID, "node", node.Lat, node.Lon, node.Tags}
-	//json, _ := json.Marshal(marshall)
-	//fmt.Println(string(json))
-    m := marshall
-    fmt.Printf("{ \"type\": \"Feature\", \"geometry\": { \"type\": \"Point\", \"coordinates\": [ %v, %v ] }", m.Lon, m.Lat)
-    if len(m.Tags)>0 {fmt.Printf(", \"properties\": { %v }", format_tags(m.Tags))}
-    fmt.Printf(" }\n")
-}
-
-type jsonWay struct {
-	ID   int64             `json:"id"`
-	Type string            `json:"type"`
-	Tags map[string]string `json:"tags"`
-	// NodeIDs   []int64             `json:"refs"`
-	Centroid map[string]string   `json:"centroid"`
-	Bounds   map[string]string   `json:"bounds"`
+type geoJSONProperties struct {
+	OSMType  string              `json:"osm_type"`
+	OSMID    int64               `json:"osm_id"`
+	Tags     map[string]string   `json:"tags"`
+	Centroid map[string]string   `json:"centroid,omitempty"`
 	Nodes    []map[string]string `json:"nodes,omitempty"`
 }
 
-func jsonBbox(bounds *geo.Bound) map[string]string {
-	// render a North-South-East-West bounding box
-	var bbox = make(map[string]string)
-	bbox["n"] = strconv.FormatFloat(bounds.North(), 'f', 7, 64)
-	bbox["s"] = strconv.FormatFloat(bounds.South(), 'f', 7, 64)
-	bbox["e"] = strconv.FormatFloat(bounds.East(), 'f', 7, 64)
-	bbox["w"] = strconv.FormatFloat(bounds.West(), 'f', 7, 64)
-
-	return bbox
+type geoJSONFeature struct {
+	Type       string            `json:"type"`
+	ID         string            `json:"id"`
+	BBox       []float64         `json:"bbox,omitempty"`
+	Geometry   geoJSONGeometry   `json:"geometry"`
+	Properties geoJSONProperties `json:"properties"`
 }
 
-func onWay(way *osmpbf.Way, latlons []map[string]string, centroid map[string]string, bounds *geo.Bound) {
-	bbox := jsonBbox(bounds)
-	marshall := jsonWay{way.ID, "way", way.Tags /*, way.NodeIDs*/, centroid, bbox, latlons}
-	json, _ := json.Marshal(marshall)
-	fmt.Println(string(json))
+type featureWriter struct {
+	output *bufio.Writer
+	strict bool
+	wrote  bool
 }
 
-type jsonRelation struct {
-	ID       int64             `json:"id"`
-	Type     string            `json:"type"`
-	Tags     map[string]string `json:"tags"`
-	Centroid map[string]string `json:"centroid"`
-	Bounds   map[string]string `json:"bounds"`
+func newFeatureWriter(output io.Writer, strict bool) *featureWriter {
+	return &featureWriter{output: bufio.NewWriter(output), strict: strict}
 }
 
-func onRelation(relation *osmpbf.Relation, centroid map[string]string, bounds *geo.Bound) {
-	bbox := jsonBbox(bounds)
-	marshall := jsonRelation{relation.ID, "relation", relation.Tags, centroid, bbox}
-	json, _ := json.Marshal(marshall)
-	fmt.Println(string(json))
+func (writer *featureWriter) Start() error {
+	if writer.strict {
+		_, err := writer.output.WriteString(`{"type":"FeatureCollection","features":[`)
+		return err
+	}
+	return nil
+}
+
+func (writer *featureWriter) Write(feature geoJSONFeature) error {
+	encoded, err := json.Marshal(feature)
+	if err != nil {
+		return fmt.Errorf("failed to encode GeoJSON Feature %q: %w", feature.ID, err)
+	}
+	if writer.strict && writer.wrote {
+		if err := writer.output.WriteByte(','); err != nil {
+			return err
+		}
+	}
+	if _, err := writer.output.Write(encoded); err != nil {
+		return err
+	}
+	if !writer.strict {
+		if err := writer.output.WriteByte('\n'); err != nil {
+			return err
+		}
+	}
+	writer.wrote = true
+	return nil
+}
+
+func (writer *featureWriter) Close() error {
+	if writer.strict {
+		if _, err := writer.output.WriteString("]}\n"); err != nil {
+			return err
+		}
+	}
+	return writer.output.Flush()
+}
+
+func newNodeFeature(node *osmpbf.Node) (geoJSONFeature, error) {
+	coordinates, err := json.Marshal([]float64{node.Lon, node.Lat})
+	if err != nil {
+		return geoJSONFeature{}, fmt.Errorf("failed to encode node %d coordinates: %w", node.ID, err)
+	}
+	return geoJSONFeature{
+		Type:     "Feature",
+		ID:       fmt.Sprintf("node/%d", node.ID),
+		Geometry: geoJSONGeometry{Type: "Point", Coordinates: coordinates},
+		Properties: geoJSONProperties{
+			OSMType: "node",
+			OSMID:   node.ID,
+			Tags:    node.Tags,
+		},
+	}, nil
+}
+
+func newWayFeature(way *osmpbf.Way, latlons []map[string]string, centroid map[string]string, bounds *geo.Bound, includeNodes bool) (geoJSONFeature, error) {
+	coordinates, err := coordinatesFromLatLons(latlons)
+	if err != nil {
+		return geoJSONFeature{}, fmt.Errorf("failed to build way %d geometry: %w", way.ID, err)
+	}
+	geometry, err := geometryFromCoordinates(coordinates)
+	if err != nil {
+		return geoJSONFeature{}, fmt.Errorf("failed to build way %d geometry: %w", way.ID, err)
+	}
+	properties := geoJSONProperties{OSMType: "way", OSMID: way.ID, Tags: way.Tags, Centroid: centroid}
+	if includeNodes {
+		properties.Nodes = latlons
+	}
+	return geoJSONFeature{
+		Type:       "Feature",
+		ID:         fmt.Sprintf("way/%d", way.ID),
+		BBox:       geoJSONBbox(bounds),
+		Geometry:   geometry,
+		Properties: properties,
+	}, nil
+}
+
+func coordinatesFromLatLons(latlons []map[string]string) ([][]float64, error) {
+	if len(latlons) == 0 {
+		return nil, fmt.Errorf("expected at least one coordinate")
+	}
+	coordinates := make([][]float64, 0, len(latlons))
+	for index, latlon := range latlons {
+		lon, err := strconv.ParseFloat(latlon["lon"], 64)
+		if err != nil {
+			return nil, fmt.Errorf("coordinate %d has invalid longitude %q: %w", index, latlon["lon"], err)
+		}
+		lat, err := strconv.ParseFloat(latlon["lat"], 64)
+		if err != nil {
+			return nil, fmt.Errorf("coordinate %d has invalid latitude %q: %w", index, latlon["lat"], err)
+		}
+		coordinates = append(coordinates, []float64{lon, lat})
+	}
+	return coordinates, nil
+}
+
+func geometryFromCoordinates(coordinates [][]float64) (geoJSONGeometry, error) {
+	geometryType := "LineString"
+	geometryCoordinates := coordinates
+	if len(coordinates) >= 4 && positionsEqual(coordinates[0], coordinates[len(coordinates)-1]) {
+		geometryType = "Polygon"
+		encoded, err := json.Marshal([][][]float64{coordinates})
+		return geoJSONGeometry{Type: geometryType, Coordinates: encoded}, err
+	}
+	encoded, err := json.Marshal(geometryCoordinates)
+	return geoJSONGeometry{Type: geometryType, Coordinates: encoded}, err
+}
+
+func geoJSONBbox(bounds *geo.Bound) []float64 {
+	if bounds == nil {
+		return nil
+	}
+	return []float64{bounds.West(), bounds.South(), bounds.East(), bounds.North()}
+}
+
+type relationWay struct {
+	Role        string
+	WayID       int64
+	Coordinates [][]float64
+}
+
+func newRelationFeature(db *leveldb.DB, relation *osmpbf.Relation, relations map[int64]*osmpbf.Relation) (geoJSONFeature, error) {
+	if relation == nil {
+		return geoJSONFeature{}, fmt.Errorf("selected relation was not present in the output pass")
+	}
+	ways := make([]relationWay, 0)
+	nodeIDs := make([]int64, 0)
+	if err := collectRelationMembers(relation, relations, "", make(map[int64]bool), &ways, &nodeIDs); err != nil {
+		return geoJSONFeature{}, fmt.Errorf("failed to expand relation %d: %w", relation.ID, err)
+	}
+	for index := range ways {
+		latlons, err := cacheLookupWayNodes(db, ways[index].WayID)
+		if err != nil {
+			return geoJSONFeature{}, fmt.Errorf("failed to denormalize relation %d member way %d: %w", relation.ID, ways[index].WayID, err)
+		}
+		coordinates, err := coordinatesFromLatLons(latlons)
+		if err != nil {
+			return geoJSONFeature{}, fmt.Errorf("failed to decode relation %d member way %d: %w", relation.ID, ways[index].WayID, err)
+		}
+		ways[index].Coordinates = coordinates
+	}
+
+	var geometry geoJSONGeometry
+	var err error
+	if relation.Tags["type"] == "multipolygon" || relation.Tags["type"] == "boundary" {
+		geometry, err = multipolygonGeometry(ways)
+	} else {
+		geometry, err = relationGeometry(db, ways, nodeIDs)
+	}
+	if err != nil {
+		return geoJSONFeature{}, fmt.Errorf("failed to build relation %d geometry: %w", relation.ID, err)
+	}
+	return geoJSONFeature{
+		Type:       "Feature",
+		ID:         fmt.Sprintf("relation/%d", relation.ID),
+		BBox:       geometryBounds(ways, db, nodeIDs),
+		Geometry:   geometry,
+		Properties: geoJSONProperties{OSMType: "relation", OSMID: relation.ID, Tags: trimTags(relation.Tags)},
+	}, nil
+}
+
+func collectRelationMembers(relation *osmpbf.Relation, relations map[int64]*osmpbf.Relation, inheritedRole string, visiting map[int64]bool, ways *[]relationWay, nodeIDs *[]int64) error {
+	if visiting[relation.ID] {
+		return fmt.Errorf("nested relation cycle includes relation %d", relation.ID)
+	}
+	visiting[relation.ID] = true
+	defer delete(visiting, relation.ID)
+
+	for _, member := range relation.Members {
+		role := member.Role
+		if inheritedRole == "outer" || inheritedRole == "inner" {
+			role = inheritedRole
+		}
+		switch member.Type {
+		case 0:
+			*nodeIDs = append(*nodeIDs, member.ID)
+		case 1:
+			*ways = append(*ways, relationWay{Role: role, WayID: member.ID})
+		case 2:
+			nested, ok := relations[member.ID]
+			if !ok {
+				return fmt.Errorf("nested relation %d was not indexed", member.ID)
+			}
+			if err := collectRelationMembers(nested, relations, role, visiting, ways, nodeIDs); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("relation %d has unknown member type %d", relation.ID, member.Type)
+		}
+	}
+	return nil
+}
+
+func multipolygonGeometry(ways []relationWay) (geoJSONGeometry, error) {
+	outerSegments := make([][][]float64, 0)
+	innerSegments := make([][][]float64, 0)
+	for _, way := range ways {
+		if way.Role == "inner" {
+			innerSegments = append(innerSegments, way.Coordinates)
+		} else {
+			outerSegments = append(outerSegments, way.Coordinates)
+		}
+	}
+	outerRings, err := stitchRings(outerSegments)
+	if err != nil {
+		return geoJSONGeometry{}, fmt.Errorf("outer rings: %w", err)
+	}
+	if len(outerRings) == 0 {
+		return geoJSONGeometry{}, fmt.Errorf("expected at least one outer ring")
+	}
+	innerRings, err := stitchRings(innerSegments)
+	if err != nil {
+		return geoJSONGeometry{}, fmt.Errorf("inner rings: %w", err)
+	}
+
+	polygons := make([][][][]float64, len(outerRings))
+	for index, ring := range outerRings {
+		polygons[index] = [][][]float64{ring}
+	}
+	for _, inner := range innerRings {
+		assigned := false
+		for outerIndex, outer := range outerRings {
+			if pointInRing(inner[0], outer) {
+				polygons[outerIndex] = append(polygons[outerIndex], inner)
+				assigned = true
+				break
+			}
+		}
+		if !assigned {
+			return geoJSONGeometry{}, fmt.Errorf("inner ring is not contained by an outer ring")
+		}
+	}
+
+	if len(polygons) == 1 {
+		encoded, err := json.Marshal(polygons[0])
+		return geoJSONGeometry{Type: "Polygon", Coordinates: encoded}, err
+	}
+	encoded, err := json.Marshal(polygons)
+	return geoJSONGeometry{Type: "MultiPolygon", Coordinates: encoded}, err
+}
+
+func relationGeometry(db *leveldb.DB, ways []relationWay, nodeIDs []int64) (geoJSONGeometry, error) {
+	geometries := make([]geoJSONGeometry, 0, len(ways)+len(nodeIDs))
+	for _, way := range ways {
+		geometry, err := geometryFromCoordinates(way.Coordinates)
+		if err != nil {
+			return geoJSONGeometry{}, err
+		}
+		geometries = append(geometries, geometry)
+	}
+	for _, nodeID := range nodeIDs {
+		latlon, err := cacheLookupNodeByID(db, nodeID)
+		if err != nil {
+			return geoJSONGeometry{}, fmt.Errorf("failed to find member node %d: %w", nodeID, err)
+		}
+		coordinates, err := coordinatesFromLatLons([]map[string]string{latlon})
+		if err != nil {
+			return geoJSONGeometry{}, err
+		}
+		encoded, err := json.Marshal(coordinates[0])
+		if err != nil {
+			return geoJSONGeometry{}, err
+		}
+		geometries = append(geometries, geoJSONGeometry{Type: "Point", Coordinates: encoded})
+	}
+	if len(geometries) == 0 {
+		return geoJSONGeometry{}, fmt.Errorf("relation has no resolvable members")
+	}
+	return geoJSONGeometry{Type: "GeometryCollection", Geometries: geometries}, nil
+}
+
+func stitchRings(segments [][][]float64) ([][][]float64, error) {
+	remaining := make([][][]float64, 0, len(segments))
+	for _, segment := range segments {
+		if len(segment) < 2 {
+			return nil, fmt.Errorf("ring segment has fewer than two positions")
+		}
+		remaining = append(remaining, copyCoordinates(segment))
+	}
+	rings := make([][][]float64, 0)
+	for len(remaining) > 0 {
+		ring := remaining[0]
+		remaining = remaining[1:]
+		for !positionsEqual(ring[0], ring[len(ring)-1]) {
+			joined := false
+			for index, segment := range remaining {
+				combined, ok := joinCoordinates(ring, segment)
+				if ok {
+					ring = combined
+					remaining = append(remaining[:index], remaining[index+1:]...)
+					joined = true
+					break
+				}
+			}
+			if !joined {
+				return nil, fmt.Errorf("could not close a ring beginning at %v", ring[0])
+			}
+		}
+		if len(ring) < 4 {
+			return nil, fmt.Errorf("closed ring has fewer than four positions")
+		}
+		rings = append(rings, ring)
+	}
+	return rings, nil
+}
+
+func joinCoordinates(ring, segment [][]float64) ([][]float64, bool) {
+	ringStart := ring[0]
+	ringEnd := ring[len(ring)-1]
+	segmentStart := segment[0]
+	segmentEnd := segment[len(segment)-1]
+	if positionsEqual(ringEnd, segmentStart) {
+		return append(ring, segment[1:]...), true
+	}
+	if positionsEqual(ringEnd, segmentEnd) {
+		reversed := reverseCoordinates(segment)
+		return append(ring, reversed[1:]...), true
+	}
+	if positionsEqual(ringStart, segmentEnd) {
+		return append(copyCoordinates(segment[:len(segment)-1]), ring...), true
+	}
+	if positionsEqual(ringStart, segmentStart) {
+		reversed := reverseCoordinates(segment)
+		return append(reversed[:len(reversed)-1], ring...), true
+	}
+	return nil, false
+}
+
+func reverseCoordinates(coordinates [][]float64) [][]float64 {
+	reversed := make([][]float64, len(coordinates))
+	for index := range coordinates {
+		reversed[len(coordinates)-1-index] = append([]float64(nil), coordinates[index]...)
+	}
+	return reversed
+}
+
+func copyCoordinates(coordinates [][]float64) [][]float64 {
+	copied := make([][]float64, len(coordinates))
+	for index, coordinate := range coordinates {
+		copied[index] = append([]float64(nil), coordinate...)
+	}
+	return copied
+}
+
+func positionsEqual(left, right []float64) bool {
+	return len(left) >= 2 && len(right) >= 2 && left[0] == right[0] && left[1] == right[1]
+}
+
+func pointInRing(point []float64, ring [][]float64) bool {
+	inside := false
+	for current, previous := 0, len(ring)-1; current < len(ring); previous, current = current, current+1 {
+		currentPoint := ring[current]
+		previousPoint := ring[previous]
+		crossesLatitude := (currentPoint[1] > point[1]) != (previousPoint[1] > point[1])
+		if crossesLatitude {
+			crossingLongitude := (previousPoint[0]-currentPoint[0])*(point[1]-currentPoint[1])/(previousPoint[1]-currentPoint[1]) + currentPoint[0]
+			if point[0] < crossingLongitude {
+				inside = !inside
+			}
+		}
+	}
+	return inside
+}
+
+func geometryBounds(ways []relationWay, db *leveldb.DB, nodeIDs []int64) []float64 {
+	bounds := []float64{math.Inf(1), math.Inf(1), math.Inf(-1), math.Inf(-1)}
+	for _, way := range ways {
+		for _, coordinate := range way.Coordinates {
+			extendBounds(bounds, coordinate)
+		}
+	}
+	for _, nodeID := range nodeIDs {
+		if latlon, err := cacheLookupNodeByID(db, nodeID); err == nil {
+			if coordinates, err := coordinatesFromLatLons([]map[string]string{latlon}); err == nil {
+				extendBounds(bounds, coordinates[0])
+			}
+		}
+	}
+	if math.IsInf(bounds[0], 1) {
+		return nil
+	}
+	return bounds
+}
+
+func extendBounds(bounds, coordinate []float64) {
+	bounds[0] = math.Min(bounds[0], coordinate[0])
+	bounds[1] = math.Min(bounds[1], coordinate[1])
+	bounds[2] = math.Max(bounds[2], coordinate[0])
+	bounds[3] = math.Max(bounds[3], coordinate[1])
 }
 
 // determine if the node is for an entrance
@@ -605,9 +947,9 @@ func openFile(filename string) *os.File {
 
 func openLevelDB(path string) *leveldb.DB {
 	// try to open the db
-	db, err := leveldb.OpenFile(path, nil)
+	db, err := leveldb.OpenFile(path, &opt.Options{ErrorIfExist: true})
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("failed to create new LevelDB at %q: %v", path, err)
 	}
 	return db
 }
@@ -620,12 +962,25 @@ func openLevelDB(path string) *leveldb.DB {
 
 // check tags contain features from a whitelist
 func matchTagsAgainstCompulsoryTagList(tags map[string]string, tagList []string) bool {
-    return true
+	for _, condition := range tagList {
+		condition = strings.TrimSpace(condition)
+		if condition == "" {
+			return false
+		}
+		keyAndValue := strings.SplitN(condition, "~", 2)
+		tagValue, ok := tags[keyAndValue[0]]
+		if !ok {
+			return false
+		}
+		if len(keyAndValue) == 2 && tagValue != keyAndValue[1] {
+			return false
+		}
+	}
+	return true
 }
 
 // check tags contain features from a groups of whitelists
 func containsValidTags(tags map[string]string, group map[string][]string) bool {
-    return true
 	for _, list := range group {
 		if matchTagsAgainstCompulsoryTagList(tags, list) {
 			return true
@@ -645,7 +1000,67 @@ func trimTags(tags map[string]string) map[string]string {
 
 // check if a tag list is empty or not
 func hasTags(tags map[string]string) bool {
-    return true
+	return len(tags) > 0
+}
+
+func runBuiltInTests() error {
+	tags := map[string]string{"amenity": "toilets", "name": "Station"}
+	conditions := map[string][]string{
+		"amenity~toilets+name": {"amenity~toilets", "name"},
+	}
+	if !hasTags(tags) || !containsValidTags(tags, conditions) {
+		return fmt.Errorf("tag matching rejected a valid AND/value condition")
+	}
+	if containsValidTags(tags, map[string][]string{"shop": {"shop"}}) {
+		return fmt.Errorf("tag matching accepted a missing tag")
+	}
+	segments := [][][]float64{
+		{{0, 0}, {1, 0}},
+		{{1, 1}, {0, 1}, {0, 0}},
+		{{1, 0}, {1, 1}},
+	}
+	rings, err := stitchRings(segments)
+	if err != nil {
+		return fmt.Errorf("ring stitching failed: %w", err)
+	}
+	if len(rings) != 1 || len(rings[0]) != 5 {
+		return fmt.Errorf("ring stitching returned %d rings with %d positions, expected one ring with five positions", len(rings), len(rings[0]))
+	}
+	feature, err := newNodeFeature(&osmpbf.Node{ID: 7, Lat: 1, Lon: 2, Tags: map[string]string{"path": `C:\data`}})
+	if err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(feature)
+	if err != nil || !json.Valid(encoded) {
+		return fmt.Errorf("node GeoJSON encoding failed: %v", err)
+	}
+	var collection bytes.Buffer
+	writer := newFeatureWriter(&collection, true)
+	if err := writer.Start(); err != nil {
+		return err
+	}
+	if err := writer.Write(feature); err != nil {
+		return err
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+	if !json.Valid(collection.Bytes()) {
+		return fmt.Errorf("strict PBF output is not valid JSON: %s", collection.String())
+	}
+	masks := NewBitmaskMap()
+	masks.Nodes.Insert(42)
+	var serialized bytes.Buffer
+	written, err := masks.WriteTo(&serialized)
+	if err != nil || written != int64(serialized.Len()) {
+		return fmt.Errorf("bitmask serialization wrote %d bytes into a %d-byte buffer: %v", written, serialized.Len(), err)
+	}
+	var decoded BitmaskMap
+	read, err := decoded.ReadFrom(bytes.NewReader(serialized.Bytes()))
+	if err != nil || read != written || !decoded.Nodes.Has(42) {
+		return fmt.Errorf("bitmask deserialization read %d of %d bytes or lost node 42: %v", read, written, err)
+	}
+	return nil
 }
 
 // select which entrance is preferable
@@ -692,9 +1107,15 @@ func computeCentroidAndBounds(latlons []map[string]string) (map[string]string, *
 
 	// convert lat/lon map to geo.PointSet
 	points := geo.NewPointSet()
-	for _, each := range latlons {
-		var lon, _ = strconv.ParseFloat(each["lon"], 64)
-		var lat, _ = strconv.ParseFloat(each["lat"], 64)
+	for index, each := range latlons {
+		lon, err := strconv.ParseFloat(each["lon"], 64)
+		if err != nil {
+			panic(fmt.Sprintf("cached coordinate %d has invalid longitude %q: %v", index, each["lon"], err))
+		}
+		lat, err := strconv.ParseFloat(each["lat"], 64)
+		if err != nil {
+			panic(fmt.Sprintf("cached coordinate %d has invalid latitude %q: %v", index, each["lat"], err))
+		}
 		points.Push(geo.NewPoint(lon, lat))
 	}
 
@@ -720,8 +1141,15 @@ func computeCentroidAndBounds(latlons []map[string]string) (map[string]string, *
 
 	// return point as lat/lon map
 	var centroid = make(map[string]string)
-	centroid["lat"] = strconv.FormatFloat(compute.Lat(), 'f', 7, 64)
-	centroid["lon"] = strconv.FormatFloat(compute.Lng(), 'f', 7, 64)
+	centroid["lat"] = formatCoordinate(compute.Lat())
+	centroid["lon"] = formatCoordinate(compute.Lng())
 
 	return centroid, points.Bound()
+}
+
+func formatCoordinate(value float64) string {
+	if math.Abs(value) < 0.00000005 {
+		value = 0
+	}
+	return strconv.FormatFloat(value, 'f', 7, 64)
 }

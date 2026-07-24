@@ -42,6 +42,14 @@ module.exports.tests.params = function(test) {
     t.equal(params[0], expected, 'waynodes is serialized into parameter');
     t.end();
   });
+  test('batch', function(t) {
+    const config = {
+      batch: 1000
+    };
+    const params = generateParams(config);
+    t.equal(params[0], '--batch=1000', 'batch is serialized');
+    t.end();
+  });
 };
 
 module.exports.all = function (tape, common) {

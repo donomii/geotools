@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"sort"
 
 	"github.com/tchap/go-patricia/patricia"
@@ -16,7 +15,7 @@ func treeIndexAdd2(str string, long, lat float64) {
 	if tree2 == nil {
 		tree2 = patricia.NewTrie()
 	}
-	key := fmt.Sprintf("%v%v", long, lat)
+	key := fmt.Sprintf("%.17g|%.17g", long, lat)
 	tree2.Insert(patricia.Prefix(key), patricia.Item(str))
 }
 func treeIndexAdd(str string, long, lat float64) {
@@ -49,9 +48,13 @@ func treeIndexAdd(str string, long, lat float64) {
 		m3.(map[int]interface{})[l3] = m4
 	}
 
-	m4.(map[int]interface{})[l4] = leaf{Pos: int32(l4), Text: str, Latitude: lat, Longitude: long}
-
-	log.Println("Added ", str)
+	newLeaf := leaf{Pos: int32(l4), Text: str, Latitude: lat, Longitude: long}
+	existing, exists := m4.(map[int]interface{})[l4]
+	if !exists {
+		m4.(map[int]interface{})[l4] = []leaf{newLeaf}
+	} else {
+		m4.(map[int]interface{})[l4] = append(existing.([]leaf), newLeaf)
+	}
 
 	//log.Printf("%+v\n", tree)
 	//jsonString, err := json.MarshalIndent(tree, "", "  ")
@@ -63,15 +66,15 @@ func treeIndexAdd(str string, long, lat float64) {
 func dumpMap(mp mapPack) {
 	for i1 := 0; i1 < len(mp.L1)-1; i1 += 1 {
 		m2start := mp.L1[i1].Index
-		m2end := mp.L1[i1].Index + 1
+		m2end := mp.L1[i1+1].Index
 		//log.Printf("1. Dumping from %v to %v\n", m2start, m2end)
 		for i2 := m2start; i2 < m2end; i2 += 1 {
 			m3start := mp.L2[i2].Index
-			m3end := mp.L2[i2].Index + 1
+			m3end := mp.L2[i2+1].Index
 			//			log.Printf("2. Dumping from %v to %v\n", m3start, m3end)
 			for i3 := m3start; i3 < m3end; i3 += 1 {
 				m4start := mp.L3[i3].Index
-				m4end := mp.L3[i3].Index + 1
+				m4end := mp.L3[i3+1].Index
 				for i4 := m4start; i4 < m4end; i4 += 1 {
 					fmt.Printf("%v,%v - %v\n", float64(mp.L1[i1].Key)+float64(mp.L2[i2].Key)/1000000, float64(mp.L3[i3].Key)+float64(mp.L4[i4].Pos)/1000000, mp.L4[i4])
 				}
@@ -85,15 +88,15 @@ func dumpMap(mp mapPack) {
 func IterateMp(mp mapPack, f func(float64, float64, leaf)) {
 	for i1 := 0; i1 < len(mp.L1)-1; i1 += 1 {
 		m2start := mp.L1[i1].Index
-		m2end := mp.L1[i1].Index + 1
+		m2end := mp.L1[i1+1].Index
 		//log.Printf("1. Dumping from %v to %v\n", m2start, m2end)
 		for i2 := m2start; i2 < m2end; i2 += 1 {
 			m3start := mp.L2[i2].Index
-			m3end := mp.L2[i2].Index + 1
+			m3end := mp.L2[i2+1].Index
 			//			log.Printf("2. Dumping from %v to %v\n", m3start, m3end)
 			for i3 := m3start; i3 < m3end; i3 += 1 {
 				m4start := mp.L3[i3].Index
-				m4end := mp.L3[i3].Index + 1
+				m4end := mp.L3[i3+1].Index
 				for i4 := m4start; i4 < m4end; i4 += 1 {
 					f(float64(mp.L1[i1].Key)+float64(mp.L2[i2].Key)/1000000, float64(mp.L3[i3].Key)+float64(mp.L4[i4].Pos)/1000000, mp.L4[i4])
 					//fmt.Printf(mp.l1[i1].key, mp.l2[i2].key, mp.l3[i3].key, mp.l4[i4].pos, mp.l4[i4])
@@ -121,7 +124,7 @@ type leaf struct {
 	Longitude float64
 }
 
-func buildFinal() {
+func buildFinal() mapPack {
 
 	m1i := []node{}
 	m2i := []node{}
@@ -151,8 +154,10 @@ func buildFinal() {
 				m4 := m3[k3].(map[int]interface{})
 				m3keys := mapKeys(m4)
 				for _, k4 := range m3keys {
-					m4last += 1
-					m4i = append(m4i, m4[k4].(leaf))
+					for _, currentLeaf := range m4[k4].([]leaf) {
+						m4last += 1
+						m4i = append(m4i, currentLeaf)
+					}
 
 				}
 
@@ -175,7 +180,7 @@ func buildFinal() {
 	mp.L3 = m3i
 	mp.L4 = m4i
 
-	dumpMap(mp)
+	return mp
 }
 func mapKeys(mymap map[int]interface{}) []int {
 	keys := make([]int, len(mymap))
