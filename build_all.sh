@@ -20,5 +20,29 @@ echo "Building wikipedia2doc2vec..."
 echo "Building wikipedia2geojson..."
 (cd wikipedia2geojson && go build -o ../bin/wikipedia2geojson geoextract.go)
 
+echo "Building geojsoncheck..."
+go build -o bin/geojsoncheck ./geojsoncheck
+
+echo "Building geojsonseq..."
+go build -o bin/geojsonseq ./geojsonseq
+
+echo "Building geofilter..."
+go build -o bin/geofilter ./geofilter
+
+echo "Building geoparquet..."
+go build -o bin/geoparquet ./geoparquet
+
+echo "Building flatgeobuf..."
+go build -o bin/flatgeobuf ./flatgeobuf
+
+echo "Building jsonfg..."
+go build -o bin/jsonfg ./jsonfg
+
+echo "Building geojson2mvt..."
+go build -o bin/geojson2mvt ./geojson2mvt
+
+echo "Building mvt2geojson..."
+go build -o bin/mvt2geojson ./mvt2geojson
+
 echo "=== Build Complete! Binaries are in ./bin ==="
 ls -l bin

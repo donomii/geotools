@@ -1,0 +1,90 @@
+{
+  "type": "FeatureCollection",
+  "name": "real_places",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "Q334",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [103.8198, 1.3521]
+      },
+      "properties": {
+        "name": "Singapore",
+        "kind": "city",
+        "capital": true,
+        "population": 5917600,
+        "aliases": ["Singapore", "Singapura"]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "Q243",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [2.2945, 48.8584]
+      },
+      "properties": {
+        "name": "Eiffel Tower",
+        "kind": "landmark",
+        "capital": false,
+        "opened": 1889
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "Q45178",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [151.2153, -33.8568]
+      },
+      "properties": {
+        "name": "Sydney Opera House",
+        "kind": "landmark",
+        "capital": false,
+        "opened": 1973
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 4,
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [-122.4783, 37.8199],
+          [-122.4747, 37.8175],
+          [-122.4702, 37.8156]
+        ]
+      },
+      "properties": {
+        "name": "Golden Gate Bridge",
+        "kind": "bridge",
+        "metadata": {
+          "city": "San Francisco",
+          "country": "United States"
+        }
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [103.858, 1.282],
+            [103.866, 1.282],
+            [103.866, 1.289],
+            [103.858, 1.289],
+            [103.858, 1.282]
+          ]
+        ]
+      },
+      "properties": {
+        "name": "Marina Bay test area",
+        "kind": "area",
+        "capital": null
+      },
+      "source": "fixed real-coordinate regression fixture"
+    }
+  ]
+}
