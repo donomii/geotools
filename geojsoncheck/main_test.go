@@ -39,3 +39,10 @@ func TestCheckReportsFeatureIdentity(t *testing.T) {
 		t.Fatalf("error %q does not identify the invalid Feature", err)
 	}
 }
+
+func TestCheckRejectsInvalidFeatureCollectionBBox(t *testing.T) {
+	input := strings.NewReader(`{"type":"FeatureCollection","bbox":"not a bbox","features":[]}`)
+	if _, err := checkGeoJSON(geodata.InputAuto, geodata.ValidationOptions{}, input); err == nil {
+		t.Fatal("accepted invalid FeatureCollection bbox")
+	}
+}

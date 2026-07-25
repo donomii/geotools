@@ -86,6 +86,7 @@ func TestReadFeaturesRejectsInvalidTopLevelValues(t *testing.T) {
 		"",
 		`42`,
 		`{"type":"FeatureCollection"}`,
+		`{"type":"FeatureCollection","bbox":"invalid","features":[]}`,
 		`{"type":"Point","coordinates":[1,2]}`,
 		"\x1e42\n",
 	}
@@ -96,6 +97,22 @@ func TestReadFeaturesRejectsInvalidTopLevelValues(t *testing.T) {
 				t.Fatalf("accepted invalid input %q", input)
 			}
 		})
+	}
+}
+
+func TestFeatureMayHaveForeignFeaturesMember(t *testing.T) {
+	input := []byte(`{"type":"Feature","geometry":{"type":"Point","coordinates":[0,0]},"properties":{},"features":"foreign metadata"}`)
+	features := readFeaturesForTest(t, input, InputAuto)
+	if len(features) != 1 || string(features[0].Foreign["features"]) != `"foreign metadata"` {
+		t.Fatalf("foreign features member was not preserved: %#v", features)
+	}
+}
+
+func TestFeatureCollectionMayPutTypeAfterFeatures(t *testing.T) {
+	input := []byte(`{"features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[0,0]},"properties":{}}],"type":"FeatureCollection"}`)
+	features := readFeaturesForTest(t, input, InputAuto)
+	if len(features) != 1 {
+		t.Fatalf("out-of-order FeatureCollection returned %d Features; expected 1", len(features))
 	}
 }
 

@@ -176,6 +176,8 @@ func visitJSONToken(decoder *json.Decoder, token json.Token, visit FeatureVisito
 func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor) error {
 	members := make(map[string]json.RawMessage)
 	featuresSeen := false
+	featuresStreamed := false
+	var deferredFeatures json.RawMessage
 	for decoder.More() {
 		keyToken, err := decoder.Token()
 		if err != nil {
@@ -185,8 +187,9 @@ func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor) error {
 		if !ok {
 			return fmt.Errorf("GeoJSON object key has type %T; expected string", keyToken)
 		}
-		if key == "features" {
+		if key == "features" && rawObjectType(members["type"]) == "FeatureCollection" {
 			featuresSeen = true
+			featuresStreamed = true
 			if err := visitFeatureArray(decoder, visit); err != nil {
 				return err
 			}
@@ -195,7 +198,12 @@ func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor) error {
 			if err := decoder.Decode(&value); err != nil {
 				return fmt.Errorf("failed to decode GeoJSON member %q: %w", key, err)
 			}
-			members[key] = value
+			if key == "features" {
+				featuresSeen = true
+				deferredFeatures = value
+			} else {
+				members[key] = value
+			}
 		}
 	}
 	end, err := decoder.Token()
@@ -213,11 +221,24 @@ func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor) error {
 	if err := json.Unmarshal(typeValue, &objectType); err != nil {
 		return fmt.Errorf("GeoJSON type must be a string: %w", err)
 	}
-	if featuresSeen {
-		if objectType != "FeatureCollection" {
-			return fmt.Errorf("object contains features but has type %q instead of FeatureCollection", objectType)
+	if objectType == "FeatureCollection" {
+		if !featuresSeen {
+			return fmt.Errorf("FeatureCollection is missing features")
+		}
+		if bbox := members["bbox"]; bbox != nil {
+			if _, err := validateBBox(bbox); err != nil {
+				return fmt.Errorf("FeatureCollection bbox is invalid: %w", err)
+			}
+		}
+		if !featuresStreamed {
+			if err := visitDeferredFeatureArray(deferredFeatures, visit); err != nil {
+				return err
+			}
 		}
 		return nil
+	}
+	if featuresSeen {
+		members["features"] = deferredFeatures
 	}
 	encoded, err := json.Marshal(members)
 	if err != nil {
@@ -231,6 +252,23 @@ func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor) error {
 		return fmt.Errorf("unsupported GeoJSON object type %q; expected Feature or FeatureCollection", feature.Type)
 	}
 	return visit(feature)
+}
+
+func rawObjectType(raw json.RawMessage) string {
+	var objectType string
+	_ = json.Unmarshal(raw, &objectType)
+	return objectType
+}
+
+func visitDeferredFeatureArray(raw json.RawMessage, visit FeatureVisitor) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if err := visitFeatureArray(decoder, visit); err != nil {
+		return err
+	}
+	if decoder.More() {
+		return fmt.Errorf("FeatureCollection features contains trailing JSON data")
+	}
+	return nil
 }
 
 func visitFeatureArray(decoder *json.Decoder, visit FeatureVisitor) error {

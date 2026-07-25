@@ -44,5 +44,8 @@ go build -o bin/geojson2mvt ./geojson2mvt
 echo "Building mvt2geojson..."
 go build -o bin/mvt2geojson ./mvt2geojson
 
+echo "Building geojson2mbtiles..."
+go build -o bin/geojson2mbtiles ./geojson2mbtiles
+
 echo "=== Build Complete! Binaries are in ./bin ==="
 ls -l bin

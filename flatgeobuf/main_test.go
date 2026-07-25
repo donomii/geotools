@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"reflect"
 	"sort"
@@ -68,6 +69,111 @@ func TestFlatGeobufRejectsReservedProperty(t *testing.T) {
 	var output bytes.Buffer
 	if err := encodeFlatGeobuf(input, &output, geodata.InputAuto, "features"); err == nil {
 		t.Fatal("accepted the reserved preservation property")
+	}
+}
+
+func TestFlatGeobufEmptyCollection(t *testing.T) {
+	input := bytes.NewBufferString(`{"type":"FeatureCollection","features":[]}`)
+	var encoded bytes.Buffer
+	if err := encodeFlatGeobuf(input, &encoded, geodata.InputAuto, "empty"); err != nil {
+		t.Fatal(err)
+	}
+	reader := gogamafgb.NewFileReader(bytes.NewReader(encoded.Bytes()))
+	header, err := reader.Header()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if header.FeaturesCount() != 0 || header.IndexNodeSize() != 0 {
+		t.Fatalf("empty header has %d Features and index node size %d", header.FeaturesCount(), header.IndexNodeSize())
+	}
+	var output bytes.Buffer
+	if err := decodeFlatGeobuf(&encoded, &output, geodata.OutputCollection); err != nil {
+		t.Fatal(err)
+	}
+	if string(output.Bytes()) != `{"type":"FeatureCollection","features":[]}`+"\n" {
+		t.Fatalf("empty FlatGeobuf decoded as %s", output.Bytes())
+	}
+}
+
+func TestStreamingFlatGeobufRoundTrip(t *testing.T) {
+	data, err := os.ReadFile("../testdata/real_places.geojson")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	settings := flatEncodeSettings{InputMode: geodata.InputAuto, LayerName: "streamed", Indexed: false}
+	if err := encodeFlatGeobufWithSettings(bytes.NewReader(data), &encoded, settings); err != nil {
+		t.Fatal(err)
+	}
+	reader := gogamafgb.NewFileReader(bytes.NewReader(encoded.Bytes()))
+	header, err := reader.Header()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if header.IndexNodeSize() != 0 || header.FeaturesCount() != 0 {
+		t.Fatalf("streaming header has index node size %d and declared Feature count %d", header.IndexNodeSize(), header.FeaturesCount())
+	}
+	var output bytes.Buffer
+	if err := decodeFlatGeobuf(&encoded, &output, geodata.OutputCollection); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(sortedFlatFeatures(t, data), sortedFlatFeatures(t, output.Bytes())) {
+		t.Fatal("streaming FlatGeobuf round trip changed Features")
+	}
+}
+
+func TestFlatGeobufBBoxQueryIndexedAndStreaming(t *testing.T) {
+	data, err := os.ReadFile("../testdata/real_places.geojson")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, indexed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("indexed=%t", indexed), func(t *testing.T) {
+			var encoded bytes.Buffer
+			settings := flatEncodeSettings{InputMode: geodata.InputAuto, LayerName: "places", Indexed: indexed}
+			if err := encodeFlatGeobufWithSettings(bytes.NewReader(data), &encoded, settings); err != nil {
+				t.Fatal(err)
+			}
+			bbox := [4]float64{103, 1, 104, 2}
+			var output bytes.Buffer
+			if err := decodeFlatGeobufWithBBox(&encoded, &output, geodata.OutputCollection, &bbox); err != nil {
+				t.Fatal(err)
+			}
+			features := sortedFlatFeatures(t, output.Bytes())
+			if len(features) != 2 {
+				t.Fatalf("bbox query returned %d Features; expected Singapore point and Marina Bay polygon", len(features))
+			}
+		})
+	}
+}
+
+func TestDecodeFlatGeobufProjectFixture(t *testing.T) {
+	data, err := os.ReadFile("../testdata/external/flatgeobuf_countries.fgb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := decodeFlatGeobuf(bytes.NewReader(data), &output, geodata.OutputCollection); err != nil {
+		t.Fatal(err)
+	}
+	features := sortedFlatFeatures(t, output.Bytes())
+	if len(features) != 179 {
+		t.Fatalf("decoded %d countries from the FlatGeobuf project fixture; expected 179", len(features))
+	}
+}
+
+func TestRejectsExternalFlatGeobufInUnsupportedCRS(t *testing.T) {
+	data, err := os.ReadFile("../testdata/external/flatgeobuf_poly00.fgb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = decodeFlatGeobuf(bytes.NewReader(data), &bytes.Buffer{}, geodata.OutputCollection)
+	if err == nil {
+		t.Fatal("accepted the FlatGeobuf project EPSG:27700 fixture without reprojection")
+	}
+	expected := `organization "EPSG" numeric code 27700`
+	if !bytes.Contains([]byte(err.Error()), []byte(expected)) {
+		t.Fatalf("unsupported CRS error is %q; expected it to contain %q", err, expected)
 	}
 }
 

@@ -195,7 +195,7 @@ func writeFlatProperty(writer *gogamafgb.PropWriter, column flatColumn, raw json
 	}
 }
 
-func buildFlatHeader(layerName string, columns []flatColumn, features []flatSourceFeature) (*flat.Header, error) {
+func buildFlatHeader(layerName string, columns []flatColumn, features []flatSourceFeature, indexed bool) (*flat.Header, error) {
 	builder := flatbuffers.NewBuilder(1024)
 	columnOffsets := make([]flatbuffers.UOffsetT, len(columns))
 	for index, column := range columns {
@@ -213,20 +213,24 @@ func buildFlatHeader(layerName string, columns []flatColumn, features []flatSour
 		builder.PrependUOffsetT(columnOffsets[index])
 	}
 	columnsOffset := builder.EndVector(len(columnOffsets))
-	bounds := features[0].Geometry.Bound()
-	geometryType := flatGeometryType(features[0].Geometry)
-	for _, feature := range features[1:] {
-		bounds = bounds.Union(feature.Geometry.Bound())
-		if flatGeometryType(feature.Geometry) != geometryType {
-			geometryType = flat.GeometryTypeUnknown
+	var envelopeOffset flatbuffers.UOffsetT
+	geometryType := flat.GeometryTypeUnknown
+	if len(features) > 0 {
+		bounds := features[0].Geometry.Bound()
+		geometryType = flatGeometryType(features[0].Geometry)
+		for _, feature := range features[1:] {
+			bounds = bounds.Union(feature.Geometry.Bound())
+			if flatGeometryType(feature.Geometry) != geometryType {
+				geometryType = flat.GeometryTypeUnknown
+			}
 		}
+		envelope := []float64{bounds.Min[0], bounds.Min[1], bounds.Max[0], bounds.Max[1]}
+		flat.HeaderStartEnvelopeVector(builder, len(envelope))
+		for index := len(envelope) - 1; index >= 0; index-- {
+			builder.PrependFloat64(envelope[index])
+		}
+		envelopeOffset = builder.EndVector(len(envelope))
 	}
-	envelope := []float64{bounds.Min[0], bounds.Min[1], bounds.Max[0], bounds.Max[1]}
-	flat.HeaderStartEnvelopeVector(builder, len(envelope))
-	for index := len(envelope) - 1; index >= 0; index-- {
-		builder.PrependFloat64(envelope[index])
-	}
-	envelopeOffset := builder.EndVector(len(envelope))
 	orgOffset := builder.CreateString("EPSG")
 	nameOffset := builder.CreateString("WGS 84")
 	flat.CrsStart(builder)
@@ -237,11 +241,17 @@ func buildFlatHeader(layerName string, columns []flatColumn, features []flatSour
 	layerOffset := builder.CreateString(layerName)
 	flat.HeaderStart(builder)
 	flat.HeaderAddName(builder, layerOffset)
-	flat.HeaderAddEnvelope(builder, envelopeOffset)
+	if envelopeOffset != 0 {
+		flat.HeaderAddEnvelope(builder, envelopeOffset)
+	}
 	flat.HeaderAddGeometryType(builder, geometryType)
 	flat.HeaderAddColumns(builder, columnsOffset)
 	flat.HeaderAddFeaturesCount(builder, uint64(len(features)))
-	flat.HeaderAddIndexNodeSize(builder, 16)
+	indexNodeSize := uint16(0)
+	if indexed && len(features) > 0 {
+		indexNodeSize = 16
+	}
+	flat.HeaderAddIndexNodeSize(builder, indexNodeSize)
 	flat.HeaderAddCrs(builder, crsOffset)
 	headerOffset := flat.HeaderEnd(builder)
 	flat.FinishSizePrefixedHeaderBuffer(builder, headerOffset)

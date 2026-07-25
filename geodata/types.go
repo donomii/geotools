@@ -6,6 +6,8 @@ import (
 	"fmt"
 )
 
+const DefaultMVTIDProperty = "__geotools_geojson_id"
+
 type Feature struct {
 	Type       string
 	ID         json.RawMessage
@@ -13,6 +15,31 @@ type Feature struct {
 	Geometry   json.RawMessage
 	Properties json.RawMessage
 	Foreign    map[string]json.RawMessage
+}
+
+type MVTEncodeSettings struct {
+	Zoom              uint
+	X                 uint
+	Y                 uint
+	Layer             string
+	Extent            uint
+	Buffer            uint
+	Simplify          float64
+	Gzip              bool
+	LayerProperty     string
+	DropLayerProperty bool
+	IDProperty        string
+}
+
+type MVTDecodeSettings struct {
+	Zoom          uint
+	X             uint
+	Y             uint
+	Layer         string
+	Gzip          bool
+	AllLayers     bool
+	LayerProperty string
+	IDProperty    string
 }
 
 func (feature *Feature) UnmarshalJSON(data []byte) error {

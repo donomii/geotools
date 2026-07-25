@@ -9,90 +9,19 @@ import (
 	"os"
 
 	"github.com/donomii/geotools/geodata"
-	"github.com/paulmach/orb"
 	"github.com/paulmach/orb/encoding/mvt"
-	"github.com/paulmach/orb/geojson"
-	"github.com/paulmach/orb/maptile"
 )
 
-type tileSettings struct {
-	Zoom   uint
-	X      uint
-	Y      uint
-	Layer  string
-	Extent uint
-	Gzip   bool
-}
+type tileSettings = geodata.MVTEncodeSettings
 
 func encodeVectorTile(input io.Reader, output io.Writer, inputMode geodata.InputMode, settings tileSettings) error {
-	if settings.Zoom > 30 {
-		return fmt.Errorf("tile zoom %d exceeds supported maximum 30", settings.Zoom)
-	}
-	if settings.X > uint(^uint32(0)) || settings.Y > uint(^uint32(0)) {
-		return fmt.Errorf("tile coordinates %d/%d exceed 32-bit MVT limits", settings.X, settings.Y)
-	}
-	tile := maptile.New(uint32(settings.X), uint32(settings.Y), maptile.Zoom(settings.Zoom))
-	if !tile.Valid() {
-		return fmt.Errorf("tile %d/%d/%d is invalid; x and y must be below %d", settings.Zoom, settings.X, settings.Y, uint64(1)<<settings.Zoom)
-	}
-	if settings.Layer == "" {
-		return fmt.Errorf("MVT layer name is empty")
-	}
-	if settings.Extent < 256 || settings.Extent > uint(^uint32(0)) {
-		return fmt.Errorf("MVT extent %d is outside supported range 256 through %d", settings.Extent, uint(^uint32(0)))
-	}
-	collection := geojson.NewFeatureCollection()
-	featureNumber := 0
-	if err := geodata.ReadFeatures(input, inputMode, func(feature geodata.Feature) error {
-		featureNumber++
-		summary, err := geodata.ValidateFeature(feature, geodata.ValidationOptions{})
-		if err != nil {
-			return fmt.Errorf("MVT input Feature %d with id %s is invalid: %w", featureNumber, feature.EncodedID(), err)
-		}
-		if summary.CoordinateDimension != 2 {
-			return fmt.Errorf("MVT input Feature %d with id %s has %d-coordinate positions; MVT supports 2D positions", featureNumber, feature.EncodedID(), summary.CoordinateDimension)
-		}
-		if summary.Type == "GeometryCollection" {
-			return fmt.Errorf("MVT input Feature %d with id %s has GeometryCollection geometry; MVT supports Point, LineString, Polygon, and their multi-geometry forms", featureNumber, feature.EncodedID())
-		}
-		if summary.HasBounds && (summary.Bounds[1] < -85.0511287798066 || summary.Bounds[3] > 85.0511287798066) {
-			return fmt.Errorf("MVT input Feature %d with id %s has latitude bounds %v..%v outside Web Mercator limits -85.0511287798066..85.0511287798066", featureNumber, feature.EncodedID(), summary.Bounds[1], summary.Bounds[3])
-		}
-		converted, err := geodata.OrbFeature(feature)
-		if err != nil {
-			return err
-		}
-		collection.Append(converted)
-		return nil
-	}); err != nil {
-		return err
-	}
-	layer := mvt.NewLayer(settings.Layer, collection)
-	layer.Extent = uint32(settings.Extent)
-	layer.ProjectToTile(tile)
-	extent := float64(settings.Extent)
-	layer.Clip(orb.Bound{Min: orb.Point{-extent, -extent}, Max: orb.Point{2*extent - 1, 2*extent - 1}})
-	layers := mvt.Layers{layer}
-	var encoded []byte
-	var err error
-	if settings.Gzip {
-		encoded, err = mvt.MarshalGzipped(layers)
-	} else {
-		encoded, err = mvt.Marshal(layers)
-	}
-	if err != nil {
-		return fmt.Errorf("failed to encode tile %d/%d/%d layer %q: %w", settings.Zoom, settings.X, settings.Y, settings.Layer, err)
-	}
-	if _, err := output.Write(encoded); err != nil {
-		return fmt.Errorf("failed to write tile %d/%d/%d layer %q: %w", settings.Zoom, settings.X, settings.Y, settings.Layer, err)
-	}
-	return nil
+	return geodata.EncodeMVT(input, output, inputMode, settings)
 }
 
 func runBuiltInTest() error {
 	input := bytes.NewBufferString(`{"type":"FeatureCollection","features":[{"type":"Feature","id":1,"geometry":{"type":"Point","coordinates":[0,0]},"properties":{"name":"Null Island"}}]}`)
 	var output bytes.Buffer
-	settings := tileSettings{Zoom: 0, X: 0, Y: 0, Layer: "places", Extent: 4096}
+	settings := tileSettings{Zoom: 0, X: 0, Y: 0, Layer: "places", Extent: 4096, Buffer: 64, Simplify: 1}
 	if err := encodeVectorTile(input, &output, geodata.InputAuto, settings); err != nil {
 		return err
 	}
@@ -119,7 +48,12 @@ func main() {
 	y := flag.Uint("y", 0, "Web Mercator tile y coordinate, from 0 through 2^z-1")
 	layer := flag.String("layer", "features", "MVT layer name stored in the output tile")
 	extent := flag.Uint("extent", 4096, "Integer coordinate extent used inside the tile; 4096 is the interoperable default")
+	buffer := flag.Uint("buffer", 64, "Clipping buffer in tile coordinate units; 64 retains geometry just beyond an edge and 0 clips exactly at the edge")
+	simplifyTolerance := flag.Float64("simplify", 1, "Geometry simplification tolerance in tile coordinate units; 1 removes sub-pixel detail and 0 disables simplification")
 	gzipOutput := flag.Bool("gzip", false, "Compress the MVT output with gzip for storage or HTTP transfer")
+	layerProperty := flag.String("layer-property", "", "GeoJSON string property selecting the output layer for each Feature; empty puts every Feature in -layer")
+	dropLayerProperty := flag.Bool("drop-layer-property", false, "Remove the property named by -layer-property after choosing a layer; disabled by default so source attributes are retained")
+	idProperty := flag.String("id-property", geodata.DefaultMVTIDProperty, "MVT string property used to preserve exact GeoJSON Feature ids; empty disables preservation and leaves only non-negative integer MVT ids")
 	inputName := flag.String("input", "auto", "GeoJSON input format: auto detects JSONL, arrays, FeatureCollections, and RFC 8142 sequences; seq requires record separators")
 	runTest := flag.Bool("test", false, "Run an in-memory GeoJSON-to-MVT encode-and-decode check and exit")
 	flag.Parse()
@@ -137,7 +71,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	settings := tileSettings{Zoom: *zoom, X: *x, Y: *y, Layer: *layer, Extent: *extent, Gzip: *gzipOutput}
+	settings := tileSettings{
+		Zoom: *zoom, X: *x, Y: *y, Layer: *layer, Extent: *extent, Buffer: *buffer, Simplify: *simplifyTolerance,
+		Gzip: *gzipOutput, LayerProperty: *layerProperty, DropLayerProperty: *dropLayerProperty, IDProperty: *idProperty,
+	}
 	if err := encodeVectorTile(os.Stdin, os.Stdout, inputMode, settings); err != nil {
 		log.Fatal(err)
 	}
