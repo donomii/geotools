@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"math"
 	"os"
 	"reflect"
@@ -39,7 +41,7 @@ func TestGeoParquetRealDataRoundTrip(t *testing.T) {
 		t.Fatalf("GeoParquet contains %d rows; expected 5", file.NumRows())
 	}
 	var output bytes.Buffer
-	if err := decodeGeoParquet(&parquetData, &output, geodata.OutputCollection); err != nil {
+	if err := decodeGeoParquet(bytes.NewReader(parquetData.Bytes()), &output, geodata.OutputCollection); err != nil {
 		t.Fatal(err)
 	}
 	expected := sortedFeatureJSON(t, data)
@@ -82,6 +84,78 @@ func TestGeoParquetWritesTypedPropertyColumns(t *testing.T) {
 	}
 }
 
+func TestGeoParquetStreamingWKBUsesBoundedSchemaAndRoundTrips(t *testing.T) {
+	input := []byte(`{"type":"FeatureCollection","features":[{"type":"Feature","id":"two","geometry":{"type":"Point","coordinates":[1,2]},"properties":{"name":"first","nullable":null}},{"type":"Feature","id":"three","geometry":{"type":"LineString","coordinates":[[3,4,5],[6,7,8]]},"properties":{"name":"second","late":{"rank":2}}},{"type":"Feature","id":"none","geometry":null,"properties":{}}]}`)
+	settings := geoParquetEncodeSettings{
+		InputMode: geodata.InputAuto, CRS: geodata.CRSCRS84, GeometryEncoding: "wkb", Streaming: true,
+	}
+	var encoded bytes.Buffer
+	if err := encodeGeoParquetWithSettings(bytes.NewBuffer(input), &encoded, settings); err != nil {
+		t.Fatal(err)
+	}
+	file, err := parquet.OpenFile(bytes.NewReader(encoded.Bytes()), int64(encoded.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := file.Schema().Lookup(geoParquetPropertiesColumn); !exists {
+		t.Fatalf("streaming GeoParquet schema has no %q JSON property column", geoParquetPropertiesColumn)
+	}
+	if _, exists := file.Schema().Lookup("name"); exists {
+		t.Fatal("streaming GeoParquet unexpectedly inferred a typed name column")
+	}
+	metadataText, exists := file.Lookup("geo")
+	if !exists {
+		t.Fatal("streaming GeoParquet has no geo metadata")
+	}
+	metadata, err := parseGeoParquetMetadata(metadataText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := metadata.Columns[geoParquetGeometryColumn]
+	if len(primary.GeometryTypes) != 2 || primary.BBox != nil || primary.Covering != nil {
+		t.Fatalf("streaming mixed-dimension geometry metadata is %#v", primary)
+	}
+	var output bytes.Buffer
+	if err := decodeGeoParquet(bytes.NewReader(encoded.Bytes()), &output, geodata.OutputCollection); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(sortedFeatureJSON(t, input), sortedFeatureJSON(t, output.Bytes())) {
+		t.Fatalf("streaming GeoParquet round trip changed Feature content: %s", output.Bytes())
+	}
+}
+
+func TestGeoParquetStreamingSecondaryGeometryAndNullProperties(t *testing.T) {
+	input := []byte(`{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{"centroid":{"type":"Point","coordinates":[1,2]},"name":"area"}},{"type":"Feature","geometry":null,"properties":{"centroid":null,"name":"missing"}}]}`)
+	settings := geoParquetEncodeSettings{
+		InputMode: geodata.InputAuto, CRS: geodata.CRSCRS84, GeometryEncoding: "wkb",
+		GeometryProperties: []string{"centroid"}, Streaming: true,
+	}
+	var encoded bytes.Buffer
+	if err := encodeGeoParquetWithSettings(bytes.NewBuffer(input), &encoded, settings); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := decodeGeoParquet(bytes.NewReader(encoded.Bytes()), &output, geodata.OutputCollection); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(sortedFeatureJSON(t, input), sortedFeatureJSON(t, output.Bytes())) {
+		t.Fatalf("streaming secondary geometry round trip changed Feature content: %s", output.Bytes())
+	}
+	nullProperties := []byte(`{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":null}`)
+	encoded.Reset()
+	settings.GeometryProperties = nil
+	if err := encodeGeoParquetWithSettings(bytes.NewBuffer(nullProperties), &encoded, settings); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if err := decodeGeoParquet(bytes.NewReader(encoded.Bytes()), &output, geodata.OutputCollection); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(sortedFeatureJSON(t, nullProperties), sortedFeatureJSON(t, output.Bytes())) {
+		t.Fatalf("streaming null properties round trip changed Feature content: %s", output.Bytes())
+	}
+}
+
 func TestGeoParquetEmptyCollectionRoundTrip(t *testing.T) {
 	input := []byte(`{"type":"FeatureCollection","features":[]}`)
 	var encoded bytes.Buffer
@@ -89,11 +163,22 @@ func TestGeoParquetEmptyCollectionRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
-	if err := decodeGeoParquet(&encoded, &output, geodata.OutputCollection); err != nil {
+	if err := decodeGeoParquet(bytes.NewReader(encoded.Bytes()), &output, geodata.OutputCollection); err != nil {
 		t.Fatal(err)
 	}
 	if string(output.Bytes()) != `{"type":"FeatureCollection","features":[]}`+"\n" {
 		t.Fatalf("empty GeoParquet decoded as %s", output.Bytes())
+	}
+}
+
+func TestGeoParquetDecodeRejectsNonSeekableInputWithoutBuffering(t *testing.T) {
+	var encoded bytes.Buffer
+	if err := encodeGeoParquet(bytes.NewBufferString(`{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`), &encoded, geodata.InputAuto); err != nil {
+		t.Fatal(err)
+	}
+	err := decodeGeoParquet(bytes.NewBuffer(encoded.Bytes()), &bytes.Buffer{}, geodata.OutputJSONL)
+	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("seekable input")) {
+		t.Fatalf("non-seekable GeoParquet decode returned %v", err)
 	}
 }
 
@@ -104,11 +189,65 @@ func TestGeoParquetPreservesNullPropertiesBBoxAndForeignMembers(t *testing.T) {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
-	if err := decodeGeoParquet(&encoded, &output, geodata.OutputCollection); err != nil {
+	if err := decodeGeoParquet(bytes.NewReader(encoded.Bytes()), &output, geodata.OutputCollection); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(sortedFeatureJSON(t, input), sortedFeatureJSON(t, output.Bytes())) {
 		t.Fatalf("GeoParquet changed null properties, bbox, or foreign members: %s", output.Bytes())
+	}
+}
+
+func TestGeoParquetNullGeometryRoundTrip(t *testing.T) {
+	input := []byte(`{"type":"FeatureCollection","features":[{"type":"Feature","id":"missing","geometry":null,"properties":{"name":"unknown"}},{"type":"Feature","id":"known","geometry":{"type":"Point","coordinates":[103.8198,1.3521]},"properties":{"name":"Singapore"}}]}`)
+	for _, encoding := range []string{"wkb", "native"} {
+		t.Run(encoding, func(t *testing.T) {
+			var encoded bytes.Buffer
+			settings := geoParquetEncodeSettings{InputMode: geodata.InputAuto, CRS: geodata.CRSCRS84, GeometryEncoding: encoding}
+			if err := encodeGeoParquetWithSettings(bytes.NewReader(input), &encoded, settings); err != nil {
+				t.Fatal(err)
+			}
+			var output bytes.Buffer
+			if err := decodeGeoParquet(bytes.NewReader(encoded.Bytes()), &output, geodata.OutputCollection); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(sortedFeatureJSON(t, input), sortedFeatureJSON(t, output.Bytes())) {
+				t.Fatalf("%s GeoParquet changed null geometry data: %s", encoding, output.Bytes())
+			}
+		})
+	}
+}
+
+func TestGeoParquetSecondaryGeometryColumnsRoundTrip(t *testing.T) {
+	input := []byte(`{"type":"FeatureCollection","features":[{"type":"Feature","id":"area","geometry":null,"properties":{"name":"district","centroid":{"type":"Point","coordinates":[103.82,1.35]}}},{"type":"Feature","id":"point","geometry":{"type":"Point","coordinates":[103.81,1.36]},"properties":{"name":"station","centroid":null}}]}`)
+	var encoded bytes.Buffer
+	settings := geoParquetEncodeSettings{
+		InputMode: geodata.InputAuto, CRS: geodata.CRSCRS84, GeometryEncoding: "wkb",
+		GeometryProperties: []string{"centroid"},
+	}
+	if err := encodeGeoParquetWithSettings(bytes.NewReader(input), &encoded, settings); err != nil {
+		t.Fatal(err)
+	}
+	file, err := parquet.OpenFile(bytes.NewReader(encoded.Bytes()), int64(encoded.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadataText, exists := file.Lookup("geo")
+	if !exists {
+		t.Fatal("encoded GeoParquet has no geo metadata")
+	}
+	metadata, err := parseGeoParquetMetadata(metadataText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Columns["centroid"].Encoding != "WKB" {
+		t.Fatalf("secondary geometry metadata is %#v", metadata.Columns["centroid"])
+	}
+	var output bytes.Buffer
+	if err := decodeGeoParquet(bytes.NewReader(encoded.Bytes()), &output, geodata.OutputCollection); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(sortedFeatureJSON(t, input), sortedFeatureJSON(t, output.Bytes())) {
+		t.Fatalf("secondary geometry round trip changed Feature content: %s", output.Bytes())
 	}
 }
 
@@ -142,7 +281,7 @@ func TestDecodeExternalGeoParquetColumns(t *testing.T) {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
-	if err := decodeGeoParquet(&data, &output, geodata.OutputCollection); err != nil {
+	if err := decodeGeoParquet(bytes.NewReader(data.Bytes()), &output, geodata.OutputCollection); err != nil {
 		t.Fatal(err)
 	}
 	count := 0
@@ -161,6 +300,65 @@ func TestDecodeExternalGeoParquetColumns(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("decoded %d external GeoParquet rows; expected 1", count)
+	}
+}
+
+func TestDecodeExternalGeoParquetNullAndSecondaryGeometryColumns(t *testing.T) {
+	type externalRow struct {
+		Geometry []byte `parquet:"geometry,optional"`
+		Centroid []byte `parquet:"centroid,optional"`
+		Name     string `parquet:"name"`
+	}
+	primary, err := wkb.Marshal(orb.Point{103.81, 1.36})
+	if err != nil {
+		t.Fatal(err)
+	}
+	centroid, err := wkb.Marshal(orb.Point{103.82, 1.35})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var data bytes.Buffer
+	writer := parquet.NewGenericWriter[externalRow](&data)
+	metadata := geoParquetMetadata{
+		Version:       geoParquetVersion,
+		PrimaryColumn: "geometry",
+		Columns: map[string]geoParquetColumn{
+			"geometry": {Encoding: "WKB", GeometryTypes: []string{"Point"}},
+			"centroid": {Encoding: "WKB", GeometryTypes: []string{"Point"}},
+		},
+	}
+	encodedMetadata, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer.SetKeyValueMetadata("geo", string(encodedMetadata))
+	if _, err := writer.Write([]externalRow{
+		{Centroid: centroid, Name: "null primary"},
+		{Geometry: primary, Name: "null secondary"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := decodeGeoParquet(bytes.NewReader(data.Bytes()), &output, geodata.OutputCollection); err != nil {
+		t.Fatal(err)
+	}
+	features := collectGeoParquetFeaturesForTest(t, output.Bytes())
+	if len(features) != 2 || string(features[0].Geometry) != "null" {
+		t.Fatalf("external null primary geometry decoded as %s", output.Bytes())
+	}
+	firstProperties, err := features[0].PropertyMap()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondProperties, err := features[1].PropertyMap()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(firstProperties["centroid"], []byte(`"type":"Point"`)) || string(secondProperties["centroid"]) != "null" {
+		t.Fatalf("external secondary geometries decoded as first=%s second=%s", firstProperties["centroid"], secondProperties["centroid"])
 	}
 }
 
@@ -202,7 +400,7 @@ func TestGeoParquetRejectsUnconvertedCRS(t *testing.T) {
 			"geometry": {
 				Encoding:      "WKB",
 				GeometryTypes: []string{"Point"},
-				CRS:           json.RawMessage(`{"type":"ProjectedCRS","name":"example","id":{"authority":"EPSG","code":32648}}`),
+				CRS:           json.RawMessage(`{"type":"ProjectedCRS","name":"example","id":{"authority":"EPSG","code":32661}}`),
 			},
 		},
 	}
@@ -223,7 +421,7 @@ func TestGeoParquetThreeDimensionalProjectedRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
-	if err := decodeGeoParquet(&encoded, &output, geodata.OutputCollection); err != nil {
+	if err := decodeGeoParquet(bytes.NewReader(encoded.Bytes()), &output, geodata.OutputCollection); err != nil {
 		t.Fatal(err)
 	}
 	features := collectGeoParquetFeaturesForTest(t, output.Bytes())
@@ -238,6 +436,111 @@ func TestGeoParquetThreeDimensionalProjectedRoundTrip(t *testing.T) {
 	}
 	if math.Abs(geometry.Coordinates[0]-103.8198) > 1e-9 || math.Abs(geometry.Coordinates[1]-1.3521) > 1e-9 || geometry.Coordinates[2] != 12.5 {
 		t.Fatalf("3D projected round trip returned coordinates %v", geometry.Coordinates)
+	}
+}
+
+func TestGeoParquetUTMRoundTrip(t *testing.T) {
+	input := []byte(`{"type":"Feature","geometry":{"type":"Point","coordinates":[103.8198,1.3521]},"properties":{"name":"Singapore"}}`)
+	var encoded bytes.Buffer
+	settings := geoParquetEncodeSettings{InputMode: geodata.InputAuto, CRS: "EPSG:32648", GeometryEncoding: "wkb"}
+	if err := encodeGeoParquetWithSettings(bytes.NewReader(input), &encoded, settings); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := decodeGeoParquet(bytes.NewReader(encoded.Bytes()), &output, geodata.OutputCollection); err != nil {
+		t.Fatal(err)
+	}
+	features := collectGeoParquetFeaturesForTest(t, output.Bytes())
+	var geometry struct {
+		Coordinates []float64 `json:"coordinates"`
+	}
+	if len(features) != 1 || json.Unmarshal(features[0].Geometry, &geometry) != nil ||
+		math.Abs(geometry.Coordinates[0]-103.8198) > 1e-8 || math.Abs(geometry.Coordinates[1]-1.3521) > 1e-8 {
+		t.Fatalf("UTM GeoParquet round trip returned %s", output.Bytes())
+	}
+}
+
+func TestGeoParquetEPSG4326UsesLatitudeLongitudeAxisOrder(t *testing.T) {
+	input := []byte(`{"type":"Feature","geometry":{"type":"Point","coordinates":[103.8198,1.3521]},"properties":{}}`)
+	var encoded bytes.Buffer
+	settings := geoParquetEncodeSettings{InputMode: geodata.InputAuto, CRS: geodata.CRSEPSG4326, GeometryEncoding: "wkb"}
+	if err := encodeGeoParquetWithSettings(bytes.NewReader(input), &encoded, settings); err != nil {
+		t.Fatal(err)
+	}
+	file, err := parquet.OpenFile(bytes.NewReader(encoded.Bytes()), int64(encoded.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := file.RowGroups()[0].Rows()
+	rowBuffer := make([]parquet.Row, 1)
+	count, err := rows.ReadRows(rowBuffer)
+	if err != nil && !errors.Is(err, io.EOF) {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("read %d GeoParquet rows; expected 1", count)
+	}
+	values := make([][]parquet.Value, len(file.Schema().Columns()))
+	rowBuffer[0].Range(func(columnIndex int, columnValues []parquet.Value) bool {
+		values[columnIndex] = columnValues
+		return true
+	})
+	var geometryBytes []byte
+	for index, path := range file.Schema().Columns() {
+		if len(path) == 1 && path[0] == geoParquetGeometryColumn {
+			geometryBytes, err = singleParquetBytes(values[index], geoParquetGeometryColumn)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	storedGeometry, err := wkb.Unmarshal(geometryBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	point := storedGeometry.(orb.Point)
+	if !reflect.DeepEqual(point, orb.Point{1.3521, 103.8198}) {
+		t.Fatalf("EPSG:4326 GeoParquet stores coordinates %v; expected latitude then longitude", point)
+	}
+	var output bytes.Buffer
+	if err := decodeGeoParquet(bytes.NewReader(encoded.Bytes()), &output, geodata.OutputCollection); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(sortedFeatureJSON(t, input), sortedFeatureJSON(t, output.Bytes())) {
+		t.Fatalf("EPSG:4326 GeoParquet round trip changed Feature content: %s", output.Bytes())
+	}
+}
+
+func TestGeoParquetMixedCoordinateDimensionsOmitCovering(t *testing.T) {
+	input := []byte(`{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{"name":"2d"}},{"type":"Feature","geometry":{"type":"Point","coordinates":[3,4,5]},"properties":{"name":"3d"}}]}`)
+	var encoded bytes.Buffer
+	if err := encodeGeoParquet(bytes.NewReader(input), &encoded, geodata.InputAuto); err != nil {
+		t.Fatal(err)
+	}
+	file, err := parquet.OpenFile(bytes.NewReader(encoded.Bytes()), int64(encoded.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadataText, exists := file.Lookup("geo")
+	if !exists {
+		t.Fatal("mixed-dimension GeoParquet has no geo metadata")
+	}
+	metadata, err := parseGeoParquetMetadata(metadataText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Columns[geoParquetGeometryColumn].Covering != nil || metadata.Columns[geoParquetGeometryColumn].BBox != nil {
+		t.Fatalf("mixed-dimension metadata contains an invalid covering or bbox: %#v", metadata.Columns[geoParquetGeometryColumn])
+	}
+	if _, exists := file.Schema().Lookup(geoParquetCoveringColumn, "xmin"); exists {
+		t.Fatal("mixed-dimension GeoParquet contains a fixed-dimension covering column")
+	}
+	var output bytes.Buffer
+	if err := decodeGeoParquet(bytes.NewReader(encoded.Bytes()), &output, geodata.OutputCollection); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(sortedFeatureJSON(t, input), sortedFeatureJSON(t, output.Bytes())) {
+		t.Fatalf("mixed-dimension GeoParquet round trip changed Feature content: %s", output.Bytes())
 	}
 }
 
@@ -260,7 +563,7 @@ func TestNativeGeoParquetRoundTripsGeometryTypes(t *testing.T) {
 				t.Fatal(err)
 			}
 			var output bytes.Buffer
-			if err := decodeGeoParquet(&encoded, &output, geodata.OutputCollection); err != nil {
+			if err := decodeGeoParquet(bytes.NewReader(encoded.Bytes()), &output, geodata.OutputCollection); err != nil {
 				t.Fatal(err)
 			}
 			if !reflect.DeepEqual(sortedFeatureJSON(t, input), sortedFeatureJSON(t, output.Bytes())) {
@@ -302,7 +605,7 @@ func TestDecodeNestedExternalGeoParquetColumns(t *testing.T) {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
-	if err := decodeGeoParquet(&data, &output, geodata.OutputCollection); err != nil {
+	if err := decodeGeoParquet(bytes.NewReader(data.Bytes()), &output, geodata.OutputCollection); err != nil {
 		t.Fatal(err)
 	}
 	features := collectGeoParquetFeaturesForTest(t, output.Bytes())

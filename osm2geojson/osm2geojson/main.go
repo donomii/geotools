@@ -137,8 +137,8 @@ func convertOSM(input io.Reader, output io.Writer, strictOutput bool) error {
 	if err := writer.Start(); err != nil {
 		return err
 	}
-	nodes := make(map[string][]float64)
-	ways := make(map[string]osmStoredWay)
+	nodes := make(map[int64][2]float64)
+	ways := make(map[int64]osmStoredWay)
 	relations := make([]osmXMLRelation, 0)
 	decoder := xml.NewDecoder(input)
 
@@ -163,7 +163,11 @@ func convertOSM(input io.Reader, output io.Writer, strictOutput bool) error {
 			if err != nil {
 				return err
 			}
-			nodes[node.ID] = position
+			nodeID, err := osmNumericID(node.ID, "node")
+			if err != nil {
+				return err
+			}
+			nodes[nodeID] = position
 			if err := writer.Write(feature); err != nil {
 				return err
 			}
@@ -176,7 +180,11 @@ func convertOSM(input io.Reader, output io.Writer, strictOutput bool) error {
 			if err != nil {
 				return err
 			}
-			ways[way.ID] = stored
+			wayID, err := osmNumericID(way.ID, "way")
+			if err != nil {
+				return err
+			}
+			ways[wayID] = stored
 			if err := writer.Write(feature); err != nil {
 				return err
 			}
@@ -189,9 +197,13 @@ func convertOSM(input io.Reader, output io.Writer, strictOutput bool) error {
 		}
 	}
 
-	relationByID := make(map[string]osmXMLRelation, len(relations))
+	relationByID := make(map[int64]osmXMLRelation, len(relations))
 	for _, relation := range relations {
-		relationByID[relation.ID] = relation
+		relationID, err := osmNumericID(relation.ID, "relation")
+		if err != nil {
+			return err
+		}
+		relationByID[relationID] = relation
 	}
 	for _, relation := range relations {
 		feature, err := osmRelationFeature(relation, nodes, ways, relationByID)
@@ -205,22 +217,22 @@ func convertOSM(input io.Reader, output io.Writer, strictOutput bool) error {
 	return writer.Close()
 }
 
-func osmNodeFeature(node osmXMLNode) (osmFeature, []float64, error) {
+func osmNodeFeature(node osmXMLNode) (osmFeature, [2]float64, error) {
 	if node.ID == "" {
-		return osmFeature{}, nil, fmt.Errorf("OSM node is missing id")
+		return osmFeature{}, [2]float64{}, fmt.Errorf("OSM node is missing id")
 	}
 	lat, err := strconv.ParseFloat(node.Lat, 64)
 	if err != nil {
-		return osmFeature{}, nil, fmt.Errorf("OSM node %s has invalid latitude %q: %w", node.ID, node.Lat, err)
+		return osmFeature{}, [2]float64{}, fmt.Errorf("OSM node %s has invalid latitude %q: %w", node.ID, node.Lat, err)
 	}
 	lon, err := strconv.ParseFloat(node.Lon, 64)
 	if err != nil {
-		return osmFeature{}, nil, fmt.Errorf("OSM node %s has invalid longitude %q: %w", node.ID, node.Lon, err)
+		return osmFeature{}, [2]float64{}, fmt.Errorf("OSM node %s has invalid longitude %q: %w", node.ID, node.Lon, err)
 	}
-	position := []float64{lon, lat}
+	position := [2]float64{lon, lat}
 	encoded, err := json.Marshal(position)
 	if err != nil {
-		return osmFeature{}, nil, err
+		return osmFeature{}, [2]float64{}, err
 	}
 	return osmFeature{
 		Type:       "Feature",
@@ -230,7 +242,7 @@ func osmNodeFeature(node osmXMLNode) (osmFeature, []float64, error) {
 	}, position, nil
 }
 
-func osmWayFeature(way osmXMLWay, nodes map[string][]float64) (osmFeature, osmStoredWay, error) {
+func osmWayFeature(way osmXMLWay, nodes map[int64][2]float64) (osmFeature, osmStoredWay, error) {
 	if way.ID == "" {
 		return osmFeature{}, osmStoredWay{}, fmt.Errorf("OSM way is missing id")
 	}
@@ -239,11 +251,15 @@ func osmWayFeature(way osmXMLWay, nodes map[string][]float64) (osmFeature, osmSt
 	}
 	coordinates := make([][]float64, 0, len(way.NodeReferences))
 	for _, reference := range way.NodeReferences {
-		position, ok := nodes[reference.Reference]
+		nodeID, err := osmNumericID(reference.Reference, "node reference")
+		if err != nil {
+			return osmFeature{}, osmStoredWay{}, fmt.Errorf("OSM way %s: %w", way.ID, err)
+		}
+		position, ok := nodes[nodeID]
 		if !ok {
 			return osmFeature{}, osmStoredWay{}, fmt.Errorf("OSM way %s references missing node %s", way.ID, reference.Reference)
 		}
-		coordinates = append(coordinates, append([]float64(nil), position...))
+		coordinates = append(coordinates, []float64{position[0], position[1]})
 	}
 	geometry, err := osmGeometryFromCoordinates(coordinates)
 	if err != nil {
@@ -259,7 +275,7 @@ func osmWayFeature(way osmXMLWay, nodes map[string][]float64) (osmFeature, osmSt
 	}, stored, nil
 }
 
-func osmRelationFeature(relation osmXMLRelation, nodes map[string][]float64, ways map[string]osmStoredWay, relations map[string]osmXMLRelation) (osmFeature, error) {
+func osmRelationFeature(relation osmXMLRelation, nodes map[int64][2]float64, ways map[int64]osmStoredWay, relations map[int64]osmXMLRelation) (osmFeature, error) {
 	tags := osmTags(relation.Tags)
 	var geometry osmGeometry
 	var segments []osmRelationSegment
@@ -283,7 +299,7 @@ func osmRelationFeature(relation osmXMLRelation, nodes map[string][]float64, way
 	}, nil
 }
 
-func osmRelationCollection(relation osmXMLRelation, nodes map[string][]float64, ways map[string]osmStoredWay, relations map[string]osmXMLRelation, visiting map[string]bool) (osmGeometry, error) {
+func osmRelationCollection(relation osmXMLRelation, nodes map[int64][2]float64, ways map[int64]osmStoredWay, relations map[int64]osmXMLRelation, visiting map[string]bool) (osmGeometry, error) {
 	if visiting[relation.ID] {
 		return osmGeometry{}, fmt.Errorf("nested relation cycle includes relation %s", relation.ID)
 	}
@@ -293,7 +309,11 @@ func osmRelationCollection(relation osmXMLRelation, nodes map[string][]float64, 
 	for _, member := range relation.Members {
 		switch member.Type {
 		case "node":
-			position, ok := nodes[member.Reference]
+			nodeID, err := osmNumericID(member.Reference, "relation member node")
+			if err != nil {
+				return osmGeometry{}, err
+			}
+			position, ok := nodes[nodeID]
 			if !ok {
 				return osmGeometry{}, fmt.Errorf("member node %s was not found", member.Reference)
 			}
@@ -303,13 +323,21 @@ func osmRelationCollection(relation osmXMLRelation, nodes map[string][]float64, 
 			}
 			geometries = append(geometries, osmGeometry{Type: "Point", Coordinates: encoded})
 		case "way":
-			way, ok := ways[member.Reference]
+			wayID, err := osmNumericID(member.Reference, "relation member way")
+			if err != nil {
+				return osmGeometry{}, err
+			}
+			way, ok := ways[wayID]
 			if !ok {
 				return osmGeometry{}, fmt.Errorf("member way %s was not found", member.Reference)
 			}
 			geometries = append(geometries, way.Geometry)
 		case "relation":
-			nested, ok := relations[member.Reference]
+			relationID, err := osmNumericID(member.Reference, "nested relation")
+			if err != nil {
+				return osmGeometry{}, err
+			}
+			nested, ok := relations[relationID]
 			if !ok {
 				return osmGeometry{}, fmt.Errorf("member relation %s was not found", member.Reference)
 			}
@@ -328,7 +356,7 @@ func osmRelationCollection(relation osmXMLRelation, nodes map[string][]float64, 
 	return osmGeometry{Type: "GeometryCollection", Geometries: geometries}, nil
 }
 
-func osmCollectRelationWays(relation osmXMLRelation, ways map[string]osmStoredWay, relations map[string]osmXMLRelation, inheritedRole string, visiting map[string]bool) ([]osmRelationSegment, error) {
+func osmCollectRelationWays(relation osmXMLRelation, ways map[int64]osmStoredWay, relations map[int64]osmXMLRelation, inheritedRole string, visiting map[string]bool) ([]osmRelationSegment, error) {
 	if visiting[relation.ID] {
 		return nil, fmt.Errorf("nested relation cycle includes relation %s", relation.ID)
 	}
@@ -342,13 +370,21 @@ func osmCollectRelationWays(relation osmXMLRelation, ways map[string]osmStoredWa
 		}
 		switch member.Type {
 		case "way":
-			way, ok := ways[member.Reference]
+			wayID, err := osmNumericID(member.Reference, "relation member way")
+			if err != nil {
+				return nil, err
+			}
+			way, ok := ways[wayID]
 			if !ok {
 				return nil, fmt.Errorf("member way %s was not found", member.Reference)
 			}
 			segments = append(segments, osmRelationSegment{Role: role, Coordinates: osmCopyCoordinates(way.Coordinates)})
 		case "relation":
-			nested, ok := relations[member.Reference]
+			relationID, err := osmNumericID(member.Reference, "nested relation")
+			if err != nil {
+				return nil, err
+			}
+			nested, ok := relations[relationID]
 			if !ok {
 				return nil, fmt.Errorf("member relation %s was not found", member.Reference)
 			}
@@ -360,6 +396,14 @@ func osmCollectRelationWays(relation osmXMLRelation, ways map[string]osmStoredWa
 		}
 	}
 	return segments, nil
+}
+
+func osmNumericID(value, description string) (int64, error) {
+	id, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("OSM %s id %q is not a signed 64-bit integer: %w", description, value, err)
+	}
+	return id, nil
 }
 
 func osmMultipolygonGeometry(segments []osmRelationSegment) (osmGeometry, error) {

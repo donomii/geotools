@@ -10,6 +10,7 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/donomii/geotools/geodata"
 	"github.com/parquet-go/parquet-go"
@@ -25,22 +26,27 @@ const (
 	geoParquetForeignColumn       = "__geotools_foreign"
 	geoParquetNullsColumn         = "__geotools_property_nulls"
 	geoParquetPropertiesNilColumn = "__geotools_properties_null"
+	geoParquetPropertiesColumn    = "__geotools_properties"
 	geoParquetToolMetadataKey     = "geotools"
 )
 
 type geoParquetEncodeSettings struct {
-	InputMode        geodata.InputMode
-	CRS              string
-	GeometryEncoding string
+	InputMode          geodata.InputMode
+	CRS                string
+	GeometryEncoding   string
+	GeometryProperties []string
+	Streaming          bool
 }
 
 type encodedGeoParquetFeature struct {
-	Feature        geodata.Feature
-	Geometry       geom.T
-	GeometryWKB    []byte
-	Properties     map[string]json.RawMessage
-	NullProperties []string
-	Bounds         []float64
+	Feature             geodata.Feature
+	Geometry            geom.T
+	GeometryWKB         []byte
+	SecondaryGeometries map[string]geom.T
+	SecondaryWKB        map[string][]byte
+	Properties          map[string]json.RawMessage
+	NullProperties      []string
+	Bounds              []float64
 }
 
 type geoParquetPropertyKind int
@@ -62,6 +68,7 @@ type geoParquetToolMetadata struct {
 	ForeignColumn        string            `json:"foreign_column"`
 	NullPropertiesColumn string            `json:"null_properties_column"`
 	PropertiesNullColumn string            `json:"properties_null_column"`
+	PropertiesColumn     string            `json:"properties_column,omitempty"`
 }
 
 type nativeCoordinate struct {
@@ -86,14 +93,27 @@ func encodeGeoParquetWithSettings(input io.Reader, output io.Writer, settings ge
 	if geometryEncoding != "wkb" && geometryEncoding != "native" {
 		return fmt.Errorf("GeoParquet geometry encoding is %q; expected wkb or native", settings.GeometryEncoding)
 	}
-	features, propertyKinds, geometryTypes, err := collectGeoParquetFeatures(input, settings.InputMode, targetCRS)
+	geometryProperties, err := normalizeGeoParquetGeometryProperties(settings.GeometryProperties)
+	if err != nil {
+		return err
+	}
+	if settings.Streaming {
+		if geometryEncoding != "wkb" {
+			return fmt.Errorf("streaming GeoParquet requires WKB geometry encoding because native encoding needs one geometry type and dimension before the schema is written")
+		}
+		return encodeStreamingGeoParquet(input, output, settings.InputMode, targetCRS, geometryProperties)
+	}
+	features, propertyKinds, geometryTypes, err := collectGeoParquetFeatures(input, settings.InputMode, targetCRS, geometryProperties)
 	if err != nil {
 		return err
 	}
 	nativeType := ""
 	dimension := 2
-	if len(features) > 0 {
-		dimension = features[0].Geometry.Stride()
+	for _, feature := range features {
+		if feature.Geometry != nil {
+			dimension = feature.Geometry.Stride()
+			break
+		}
 	}
 	if geometryEncoding == "native" {
 		nativeType, dimension, err = nativeGeoParquetType(features)
@@ -101,18 +121,19 @@ func encodeGeoParquetWithSettings(input io.Reader, output io.Writer, settings ge
 			return err
 		}
 	} else {
-		for index := 1; index < len(features); index++ {
-			if features[index].Geometry.Stride() != dimension {
-				return fmt.Errorf("GeoParquet covering columns require one coordinate dimension; Feature 1 is %dD while Feature %d is %dD", dimension, index+1, features[index].Geometry.Stride())
+		for index := range features {
+			if features[index].Geometry != nil && features[index].Geometry.Stride() != dimension {
+				dimension = 0
+				break
 			}
 		}
 	}
-	propertyColumns := allocateGeoParquetPropertyColumns(propertyKinds)
-	schema, err := buildGeoParquetSchema(propertyKinds, propertyColumns, geometryEncoding, nativeType, dimension)
+	propertyColumns := allocateGeoParquetPropertyColumns(propertyKinds, geometryProperties)
+	schema, err := buildGeoParquetSchema(propertyKinds, propertyColumns, geometryEncoding, nativeType, dimension, geometryProperties)
 	if err != nil {
 		return err
 	}
-	metadata, err := buildGeoParquetMetadata(features, geometryTypes, targetCRS, geometryEncoding, nativeType, dimension)
+	metadata, err := buildGeoParquetMetadata(features, geometryTypes, targetCRS, geometryEncoding, nativeType, dimension, geometryProperties)
 	if err != nil {
 		return err
 	}
@@ -137,7 +158,7 @@ func encodeGeoParquetWithSettings(input io.Reader, output io.Writer, settings ge
 	writer.SetKeyValueMetadata("geo", string(encodedMetadata))
 	writer.SetKeyValueMetadata(geoParquetToolMetadataKey, string(encodedToolMetadata))
 	for index := range features {
-		row, err := buildGeoParquetRow(schema, features[index], propertyKinds, propertyColumns, geometryEncoding)
+		row, err := buildGeoParquetRow(schema, features[index], propertyKinds, propertyColumns, geometryEncoding, geometryProperties)
 		if err != nil {
 			return errors.Join(fmt.Errorf("failed to build GeoParquet row %d for Feature %s: %w", index+1, features[index].Feature.EncodedID(), err), writer.Close())
 		}
@@ -151,78 +172,352 @@ func encodeGeoParquetWithSettings(input io.Reader, output io.Writer, settings ge
 	return nil
 }
 
-func collectGeoParquetFeatures(input io.Reader, inputMode geodata.InputMode, targetCRS string) ([]encodedGeoParquetFeature, map[string]geoParquetPropertyKind, map[string]bool, error) {
+type geoParquetGeometryStats struct {
+	Types          map[string]bool
+	Dimension      int
+	MixedDimension bool
+	BBox           []float64
+}
+
+func encodeStreamingGeoParquet(input io.Reader, output io.Writer, inputMode geodata.InputMode, targetCRS string, geometryProperties []string) error {
+	schema := buildStreamingGeoParquetSchema(geometryProperties)
+	writer := parquet.NewWriter(output, schema, parquet.MaxRowsPerRowGroup(65536))
+	toolMetadata := geoParquetToolMetadata{
+		Version:              1,
+		PropertyColumns:      map[string]string{},
+		IDColumn:             geoParquetIDColumn,
+		FeatureBBoxColumn:    geoParquetFeatureBBoxColumn,
+		ForeignColumn:        geoParquetForeignColumn,
+		NullPropertiesColumn: geoParquetNullsColumn,
+		PropertiesNullColumn: geoParquetPropertiesNilColumn,
+		PropertiesColumn:     geoParquetPropertiesColumn,
+	}
+	encodedToolMetadata, err := json.Marshal(toolMetadata)
+	if err != nil {
+		return errors.Join(err, writer.Close())
+	}
+	writer.SetKeyValueMetadata(geoParquetToolMetadataKey, string(encodedToolMetadata))
+	primaryStats := newGeoParquetGeometryStats()
+	secondaryStats := make(map[string]*geoParquetGeometryStats, len(geometryProperties))
+	for _, name := range geometryProperties {
+		secondaryStats[name] = newGeoParquetGeometryStats()
+	}
+	featureNumber := 0
+	readErr := geodata.ReadFeatures(input, inputMode, func(feature geodata.Feature) error {
+		featureNumber++
+		encoded, err := prepareEncodedGeoParquetFeature(feature, targetCRS, geometryProperties)
+		if err != nil {
+			return fmt.Errorf("GeoParquet input Feature %d with id %s is invalid: %w", featureNumber, feature.EncodedID(), err)
+		}
+		if err := primaryStats.Add(encoded.Geometry, encoded.Bounds); err != nil {
+			return fmt.Errorf("GeoParquet input Feature %d with id %s primary geometry metadata is invalid: %w", featureNumber, feature.EncodedID(), err)
+		}
+		for name, geometry := range encoded.SecondaryGeometries {
+			if err := secondaryStats[name].Add(geometry, geoParquetGeometryBounds(geometry)); err != nil {
+				return fmt.Errorf("GeoParquet input Feature %d with id %s secondary geometry %q metadata is invalid: %w", featureNumber, feature.EncodedID(), name, err)
+			}
+		}
+		row, err := buildStreamingGeoParquetRow(schema, encoded, geometryProperties)
+		if err != nil {
+			return fmt.Errorf("failed to build streaming GeoParquet row %d for Feature %s: %w", featureNumber, feature.EncodedID(), err)
+		}
+		if _, err := writer.WriteRows([]parquet.Row{row}); err != nil {
+			return fmt.Errorf("failed to write streaming GeoParquet row %d for Feature %s: %w", featureNumber, feature.EncodedID(), err)
+		}
+		return nil
+	})
+	if readErr != nil {
+		return errors.Join(readErr, writer.Close())
+	}
+	metadata, err := buildStreamingGeoParquetMetadata(primaryStats, secondaryStats, targetCRS)
+	if err != nil {
+		return errors.Join(err, writer.Close())
+	}
+	encodedMetadata, err := json.Marshal(metadata)
+	if err != nil {
+		return errors.Join(err, writer.Close())
+	}
+	writer.SetKeyValueMetadata("geo", string(encodedMetadata))
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("failed to finish streaming GeoParquet output after %d Features: %w", featureNumber, err)
+	}
+	return nil
+}
+
+func buildStreamingGeoParquetSchema(geometryProperties []string) *parquet.Schema {
+	group := parquet.Group{
+		geoParquetGeometryColumn:      parquet.Optional(parquet.Leaf(parquet.ByteArrayType)),
+		geoParquetIDColumn:            parquet.Optional(parquet.JSON()),
+		geoParquetFeatureBBoxColumn:   parquet.Optional(parquet.JSON()),
+		geoParquetForeignColumn:       parquet.Optional(parquet.JSON()),
+		geoParquetNullsColumn:         parquet.Optional(parquet.JSON()),
+		geoParquetPropertiesNilColumn: parquet.Optional(parquet.Leaf(parquet.BooleanType)),
+		geoParquetPropertiesColumn:    parquet.Optional(parquet.JSON()),
+	}
+	for _, name := range geometryProperties {
+		group[name] = parquet.Optional(parquet.Leaf(parquet.ByteArrayType))
+	}
+	return parquet.NewSchema("geotools", group)
+}
+
+func buildStreamingGeoParquetRow(schema *parquet.Schema, feature encodedGeoParquetFeature, geometryProperties []string) (parquet.Row, error) {
+	rowFeature := feature
+	rowFeature.Properties = nil
+	rowFeature.NullProperties = nil
+	row, err := buildGeoParquetRow(schema, rowFeature, map[string]geoParquetPropertyKind{}, map[string]string{}, "wkb", geometryProperties)
+	if err != nil {
+		return nil, err
+	}
+	properties := json.RawMessage("null")
+	if !bytes.Equal(bytes.TrimSpace(feature.Feature.Properties), []byte("null")) {
+		properties, err = json.Marshal(feature.Properties)
+		if err != nil {
+			return nil, err
+		}
+	}
+	columnValues := make([][]parquet.Value, len(schema.Columns()))
+	row.Range(func(columnIndex int, values []parquet.Value) bool {
+		columnValues[columnIndex] = append(columnValues[columnIndex], values...)
+		return true
+	})
+	if err := setGeoParquetColumn(schema, columnValues, geoParquetPropertiesColumn, parquet.ByteArrayValue(properties)); err != nil {
+		return nil, err
+	}
+	row = row[:0]
+	for _, values := range columnValues {
+		row = append(row, values...)
+	}
+	return row, nil
+}
+
+func newGeoParquetGeometryStats() *geoParquetGeometryStats {
+	return &geoParquetGeometryStats{Types: make(map[string]bool)}
+}
+
+func (stats *geoParquetGeometryStats) Add(geometry geom.T, bounds []float64) error {
+	if geometry == nil {
+		return nil
+	}
+	typeName, err := geoParquetGeometryType(geometry)
+	if err != nil {
+		return err
+	}
+	if geometry.Stride() == 3 {
+		typeName += " Z"
+	}
+	stats.Types[typeName] = true
+	if stats.Dimension == 0 {
+		stats.Dimension = geometry.Stride()
+	} else if stats.Dimension != geometry.Stride() {
+		stats.MixedDimension = true
+		stats.BBox = nil
+	}
+	if stats.MixedDimension || len(bounds) == 0 {
+		return nil
+	}
+	if stats.BBox == nil {
+		stats.BBox = append([]float64(nil), bounds...)
+	} else {
+		mergeNDGeoParquetBounds(stats.BBox, bounds)
+	}
+	return nil
+}
+
+func buildStreamingGeoParquetMetadata(primary *geoParquetGeometryStats, secondary map[string]*geoParquetGeometryStats, targetCRS string) (geoParquetMetadata, error) {
+	primaryColumn, err := streamingGeoParquetColumn(primary, targetCRS)
+	if err != nil {
+		return geoParquetMetadata{}, err
+	}
+	columns := map[string]geoParquetColumn{geoParquetGeometryColumn: primaryColumn}
+	for name, stats := range secondary {
+		column, err := streamingGeoParquetColumn(stats, targetCRS)
+		if err != nil {
+			return geoParquetMetadata{}, err
+		}
+		columns[name] = column
+	}
+	return geoParquetMetadata{Version: geoParquetVersion, PrimaryColumn: geoParquetGeometryColumn, Columns: columns}, nil
+}
+
+func streamingGeoParquetColumn(stats *geoParquetGeometryStats, targetCRS string) (geoParquetColumn, error) {
+	column := geoParquetColumn{Encoding: "WKB", GeometryTypes: make([]string, 0, len(stats.Types))}
+	for geometryType := range stats.Types {
+		column.GeometryTypes = append(column.GeometryTypes, geometryType)
+	}
+	sort.Strings(column.GeometryTypes)
+	if !stats.MixedDimension {
+		column.BBox = append([]float64(nil), stats.BBox...)
+	}
+	if targetCRS != geodata.CRSCRS84 {
+		crs, err := geodata.GeoParquetCRS(targetCRS)
+		if err != nil {
+			return geoParquetColumn{}, err
+		}
+		column.CRS = crs
+	}
+	return column, nil
+}
+
+func geoParquetGeometryBounds(geometry geom.T) []float64 {
+	if geometry == nil {
+		return nil
+	}
+	bounds := geometry.Bounds()
+	values := make([]float64, 0, geometry.Stride()*2)
+	for axis := 0; axis < geometry.Stride(); axis++ {
+		values = append(values, bounds.Min(axis))
+	}
+	for axis := 0; axis < geometry.Stride(); axis++ {
+		values = append(values, bounds.Max(axis))
+	}
+	return values
+}
+
+func collectGeoParquetFeatures(input io.Reader, inputMode geodata.InputMode, targetCRS string, geometryProperties []string) ([]encodedGeoParquetFeature, map[string]geoParquetPropertyKind, map[string]bool, error) {
 	var features []encodedGeoParquetFeature
 	propertyKinds := make(map[string]geoParquetPropertyKind)
 	geometryTypes := make(map[string]bool)
 	err := geodata.ReadFeatures(input, inputMode, func(feature geodata.Feature) error {
 		featureNumber := len(features) + 1
-		summary, err := geodata.ValidateFeature(feature, geodata.ValidationOptions{})
+		encoded, err := prepareEncodedGeoParquetFeature(feature, targetCRS, geometryProperties)
 		if err != nil {
 			return fmt.Errorf("GeoParquet input Feature %d with id %s is invalid: %w", featureNumber, feature.EncodedID(), err)
 		}
-		if summary.CoordinateDimension != 2 && summary.CoordinateDimension != 3 {
-			return fmt.Errorf("GeoParquet input Feature %d with id %s has %d-coordinate positions; GeoParquet supports 2D or 3D positions", featureNumber, feature.EncodedID(), summary.CoordinateDimension)
-		}
-		geometry, err := geodata.DecodeGeomJSON(feature.Geometry)
-		if err != nil {
-			return fmt.Errorf("failed to decode Feature %s geometry: %w", feature.EncodedID(), err)
-		}
-		sourceCRS := geodata.CRSCRS84
-		if summary.CoordinateDimension == 3 {
-			sourceCRS = geodata.CRSCRS84h
-		}
-		if _, err := geodata.TransformGeometry(geometry, sourceCRS, targetCRS); err != nil {
-			return fmt.Errorf("failed to reproject Feature %s geometry: %w", feature.EncodedID(), err)
-		}
-		geometryWKB, err := geomwkb.Marshal(geometry, binary.LittleEndian)
-		if err != nil {
-			return fmt.Errorf("failed to encode Feature %s geometry as WKB: %w", feature.EncodedID(), err)
-		}
-		properties, err := feature.PropertyMap()
-		if err != nil {
-			return err
-		}
-		nullProperties := make([]string, 0)
-		for name, raw := range properties {
+		for name, raw := range encoded.Properties {
 			kind, hasValue, err := inferGeoParquetPropertyKind(raw)
 			if err != nil {
 				return fmt.Errorf("Feature %s property %q is invalid: %w", feature.EncodedID(), name, err)
 			}
-			if !hasValue {
-				nullProperties = append(nullProperties, name)
-			} else {
+			if hasValue {
 				propertyKinds[name] = promoteGeoParquetPropertyKind(propertyKinds[name], kind)
 			}
 		}
-		sort.Strings(nullProperties)
-		typeName, err := geoParquetGeometryType(geometry)
-		if err != nil {
-			return err
+		if encoded.Geometry != nil {
+			typeName, err := geoParquetGeometryType(encoded.Geometry)
+			if err != nil {
+				return err
+			}
+			if encoded.Geometry.Stride() == 3 {
+				typeName += " Z"
+			}
+			geometryTypes[typeName] = true
 		}
-		if summary.CoordinateDimension == 3 {
-			typeName += " Z"
-		}
-		geometryTypes[typeName] = true
-		bounds := geometry.Bounds()
-		featureBounds := make([]float64, 0, summary.CoordinateDimension*2)
-		for coordinateIndex := 0; coordinateIndex < summary.CoordinateDimension; coordinateIndex++ {
-			featureBounds = append(featureBounds, bounds.Min(coordinateIndex))
-		}
-		for coordinateIndex := 0; coordinateIndex < summary.CoordinateDimension; coordinateIndex++ {
-			featureBounds = append(featureBounds, bounds.Max(coordinateIndex))
-		}
-		features = append(features, encodedGeoParquetFeature{
-			Feature:        feature,
-			Geometry:       geometry,
-			GeometryWKB:    geometryWKB,
-			Properties:     properties,
-			NullProperties: nullProperties,
-			Bounds:         featureBounds,
-		})
+		features = append(features, encoded)
 		return nil
 	})
 	return features, propertyKinds, geometryTypes, err
+}
+
+func prepareEncodedGeoParquetFeature(feature geodata.Feature, targetCRS string, geometryProperties []string) (encodedGeoParquetFeature, error) {
+	summary, err := geodata.ValidateFeature(feature, geodata.ValidationOptions{AllowNullGeometry: true})
+	if err != nil {
+		return encodedGeoParquetFeature{}, err
+	}
+	if summary.Type != "null" && summary.CoordinateDimension != 2 && summary.CoordinateDimension != 3 {
+		return encodedGeoParquetFeature{}, fmt.Errorf("geometry has %d-coordinate positions; GeoParquet supports 2D or 3D positions", summary.CoordinateDimension)
+	}
+	var geometry geom.T
+	var geometryWKB []byte
+	var featureBounds []float64
+	if summary.Type != "null" {
+		geometry, geometryWKB, featureBounds, err = encodeGeoParquetGeometry(feature.Geometry, targetCRS)
+		if err != nil {
+			return encodedGeoParquetFeature{}, fmt.Errorf("primary geometry cannot be encoded: %w", err)
+		}
+	}
+	properties, err := feature.PropertyMap()
+	if err != nil {
+		return encodedGeoParquetFeature{}, err
+	}
+	secondaryGeometries := make(map[string]geom.T, len(geometryProperties))
+	secondaryWKB := make(map[string][]byte, len(geometryProperties))
+	for _, name := range geometryProperties {
+		raw, exists := properties[name]
+		if !exists {
+			return encodedGeoParquetFeature{}, fmt.Errorf("secondary geometry property %q is missing", name)
+		}
+		delete(properties, name)
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			continue
+		}
+		secondaryGeometry, secondaryBytes, _, err := encodeGeoParquetGeometry(raw, targetCRS)
+		if err != nil {
+			return encodedGeoParquetFeature{}, fmt.Errorf("property %q cannot become a secondary geometry column: %w", name, err)
+		}
+		secondaryGeometries[name] = secondaryGeometry
+		secondaryWKB[name] = secondaryBytes
+	}
+	nullProperties := make([]string, 0)
+	for name, raw := range properties {
+		if _, hasValue, err := inferGeoParquetPropertyKind(raw); err != nil {
+			return encodedGeoParquetFeature{}, fmt.Errorf("property %q is invalid: %w", name, err)
+		} else if !hasValue {
+			nullProperties = append(nullProperties, name)
+		}
+	}
+	sort.Strings(nullProperties)
+	return encodedGeoParquetFeature{
+		Feature:             feature,
+		Geometry:            geometry,
+		GeometryWKB:         geometryWKB,
+		SecondaryGeometries: secondaryGeometries,
+		SecondaryWKB:        secondaryWKB,
+		Properties:          properties,
+		NullProperties:      nullProperties,
+		Bounds:              featureBounds,
+	}, nil
+}
+
+func encodeGeoParquetGeometry(raw json.RawMessage, targetCRS string) (geom.T, []byte, []float64, error) {
+	geometry, err := geodata.DecodeGeomJSON(raw)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if geometry.Stride() != 2 && geometry.Stride() != 3 {
+		return nil, nil, nil, fmt.Errorf("geometry has %d-coordinate positions; expected 2D or 3D", geometry.Stride())
+	}
+	sourceCRS := geodata.CRSCRS84
+	if geometry.Stride() == 3 {
+		sourceCRS = geodata.CRSCRS84h
+	}
+	if _, err := geodata.TransformGeometryWithCRSAxisOrder(geometry, sourceCRS, targetCRS); err != nil {
+		return nil, nil, nil, err
+	}
+	encoded, err := geomwkb.Marshal(geometry, binary.LittleEndian)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	bounds := geometry.Bounds()
+	encodedBounds := make([]float64, 0, geometry.Stride()*2)
+	for coordinateIndex := 0; coordinateIndex < geometry.Stride(); coordinateIndex++ {
+		encodedBounds = append(encodedBounds, bounds.Min(coordinateIndex))
+	}
+	for coordinateIndex := 0; coordinateIndex < geometry.Stride(); coordinateIndex++ {
+		encodedBounds = append(encodedBounds, bounds.Max(coordinateIndex))
+	}
+	return geometry, encoded, encodedBounds, nil
+}
+
+func normalizeGeoParquetGeometryProperties(names []string) ([]string, error) {
+	reserved := map[string]bool{
+		geoParquetGeometryColumn: true, geoParquetCoveringColumn: true, geoParquetIDColumn: true,
+		geoParquetFeatureBBoxColumn: true, geoParquetForeignColumn: true, geoParquetNullsColumn: true,
+		geoParquetPropertiesNilColumn: true, geoParquetPropertiesColumn: true,
+	}
+	result := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, fmt.Errorf("GeoParquet secondary geometry property name is empty")
+		}
+		if reserved[name] {
+			return nil, fmt.Errorf("GeoParquet secondary geometry property %q conflicts with a reserved column", name)
+		}
+		reserved[name] = true
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result, nil
 }
 
 func inferGeoParquetPropertyKind(raw json.RawMessage) (geoParquetPropertyKind, bool, error) {
@@ -266,7 +561,7 @@ func promoteGeoParquetPropertyKind(first, second geoParquetPropertyKind) geoParq
 	return geoParquetPropertyJSON
 }
 
-func allocateGeoParquetPropertyColumns(kinds map[string]geoParquetPropertyKind) map[string]string {
+func allocateGeoParquetPropertyColumns(kinds map[string]geoParquetPropertyKind, geometryProperties []string) map[string]string {
 	used := map[string]bool{
 		geoParquetGeometryColumn:      true,
 		geoParquetCoveringColumn:      true,
@@ -275,6 +570,10 @@ func allocateGeoParquetPropertyColumns(kinds map[string]geoParquetPropertyKind) 
 		geoParquetForeignColumn:       true,
 		geoParquetNullsColumn:         true,
 		geoParquetPropertiesNilColumn: true,
+		geoParquetPropertiesColumn:    true,
+	}
+	for _, name := range geometryProperties {
+		used[name] = true
 	}
 	names := make([]string, 0, len(kinds))
 	for name := range kinds {
@@ -293,7 +592,7 @@ func allocateGeoParquetPropertyColumns(kinds map[string]geoParquetPropertyKind) 
 	return result
 }
 
-func buildGeoParquetSchema(kinds map[string]geoParquetPropertyKind, propertyColumns map[string]string, geometryEncoding, nativeType string, dimension int) (*parquet.Schema, error) {
+func buildGeoParquetSchema(kinds map[string]geoParquetPropertyKind, propertyColumns map[string]string, geometryEncoding, nativeType string, dimension int, geometryProperties []string) (*parquet.Schema, error) {
 	group := parquet.Group{
 		geoParquetIDColumn:            parquet.Optional(parquet.JSON()),
 		geoParquetFeatureBBoxColumn:   parquet.Optional(parquet.JSON()),
@@ -302,25 +601,30 @@ func buildGeoParquetSchema(kinds map[string]geoParquetPropertyKind, propertyColu
 		geoParquetPropertiesNilColumn: parquet.Optional(parquet.Leaf(parquet.BooleanType)),
 	}
 	if geometryEncoding == "wkb" {
-		group[geoParquetGeometryColumn] = parquet.Leaf(parquet.ByteArrayType)
+		group[geoParquetGeometryColumn] = parquet.Optional(parquet.Leaf(parquet.ByteArrayType))
 	} else {
 		node, err := nativeGeoParquetNode(nativeType, dimension)
 		if err != nil {
 			return nil, err
 		}
-		group[geoParquetGeometryColumn] = node
+		group[geoParquetGeometryColumn] = parquet.Optional(node)
 	}
-	bboxGroup := parquet.Group{
-		"xmin": parquet.Leaf(parquet.DoubleType),
-		"ymin": parquet.Leaf(parquet.DoubleType),
-		"xmax": parquet.Leaf(parquet.DoubleType),
-		"ymax": parquet.Leaf(parquet.DoubleType),
+	for _, name := range geometryProperties {
+		group[name] = parquet.Optional(parquet.Leaf(parquet.ByteArrayType))
 	}
-	if dimension == 3 {
-		bboxGroup["zmin"] = parquet.Leaf(parquet.DoubleType)
-		bboxGroup["zmax"] = parquet.Leaf(parquet.DoubleType)
+	if dimension == 2 || dimension == 3 {
+		bboxGroup := parquet.Group{
+			"xmin": parquet.Leaf(parquet.DoubleType),
+			"ymin": parquet.Leaf(parquet.DoubleType),
+			"xmax": parquet.Leaf(parquet.DoubleType),
+			"ymax": parquet.Leaf(parquet.DoubleType),
+		}
+		if dimension == 3 {
+			bboxGroup["zmin"] = parquet.Leaf(parquet.DoubleType)
+			bboxGroup["zmax"] = parquet.Leaf(parquet.DoubleType)
+		}
+		group[geoParquetCoveringColumn] = parquet.Optional(bboxGroup)
 	}
-	group[geoParquetCoveringColumn] = bboxGroup
 	for name, kind := range kinds {
 		group[propertyColumns[name]] = parquet.Optional(geoParquetPropertyNode(kind))
 	}
@@ -342,7 +646,7 @@ func geoParquetPropertyNode(kind geoParquetPropertyKind) parquet.Node {
 	}
 }
 
-func buildGeoParquetMetadata(features []encodedGeoParquetFeature, geometryTypes map[string]bool, targetCRS, encoding, nativeType string, dimension int) (geoParquetMetadata, error) {
+func buildGeoParquetMetadata(features []encodedGeoParquetFeature, geometryTypes map[string]bool, targetCRS, encoding, nativeType string, dimension int, geometryProperties []string) (geoParquetMetadata, error) {
 	types := make([]string, 0, len(geometryTypes))
 	for geometryType := range geometryTypes {
 		types = append(types, geometryType)
@@ -355,14 +659,16 @@ func buildGeoParquetMetadata(features []encodedGeoParquetFeature, geometryTypes 
 	column := geoParquetColumn{
 		Encoding:      columnEncoding,
 		GeometryTypes: types,
-		Covering: geoParquetCovering{
+	}
+	if dimension == 2 || dimension == 3 {
+		column.Covering = &geoParquetCovering{
 			BBox: map[string][]string{
 				"xmin": {geoParquetCoveringColumn, "xmin"},
 				"ymin": {geoParquetCoveringColumn, "ymin"},
 				"xmax": {geoParquetCoveringColumn, "xmax"},
 				"ymax": {geoParquetCoveringColumn, "ymax"},
 			},
-		},
+		}
 	}
 	if dimension == 3 {
 		column.Covering.BBox["zmin"] = []string{geoParquetCoveringColumn, "zmin"}
@@ -375,20 +681,79 @@ func buildGeoParquetMetadata(features []encodedGeoParquetFeature, geometryTypes 
 		}
 		column.CRS = crs
 	}
-	if len(features) > 0 {
-		column.BBox = append([]float64(nil), features[0].Bounds...)
-		for _, feature := range features[1:] {
-			mergeNDGeoParquetBounds(column.BBox, feature.Bounds)
+	if dimension == 2 || dimension == 3 {
+		for _, feature := range features {
+			if len(feature.Bounds) == 0 {
+				continue
+			}
+			if column.BBox == nil {
+				column.BBox = append([]float64(nil), feature.Bounds...)
+			} else {
+				mergeNDGeoParquetBounds(column.BBox, feature.Bounds)
+			}
 		}
+	}
+	columns := map[string]geoParquetColumn{geoParquetGeometryColumn: column}
+	for _, name := range geometryProperties {
+		secondary := geoParquetColumn{Encoding: "WKB", GeometryTypes: []string{}}
+		secondaryTypes := make(map[string]bool)
+		secondaryDimension := 0
+		mixedDimensions := false
+		for _, feature := range features {
+			geometry := feature.SecondaryGeometries[name]
+			if geometry == nil {
+				continue
+			}
+			typeName, err := geoParquetGeometryType(geometry)
+			if err != nil {
+				return geoParquetMetadata{}, err
+			}
+			if geometry.Stride() == 3 {
+				typeName += " Z"
+			}
+			secondaryTypes[typeName] = true
+			if secondaryDimension == 0 {
+				secondaryDimension = geometry.Stride()
+			} else if secondaryDimension != geometry.Stride() {
+				mixedDimensions = true
+			}
+			bounds := geometry.Bounds()
+			geometryBounds := make([]float64, 0, geometry.Stride()*2)
+			for axis := 0; axis < geometry.Stride(); axis++ {
+				geometryBounds = append(geometryBounds, bounds.Min(axis))
+			}
+			for axis := 0; axis < geometry.Stride(); axis++ {
+				geometryBounds = append(geometryBounds, bounds.Max(axis))
+			}
+			if mixedDimensions {
+				secondary.BBox = nil
+			} else if secondary.BBox == nil {
+				secondary.BBox = geometryBounds
+			} else {
+				mergeNDGeoParquetBounds(secondary.BBox, geometryBounds)
+			}
+		}
+		for geometryType := range secondaryTypes {
+			secondary.GeometryTypes = append(secondary.GeometryTypes, geometryType)
+		}
+		sort.Strings(secondary.GeometryTypes)
+		if targetCRS != geodata.CRSCRS84 {
+			crs, err := geodata.GeoParquetCRS(targetCRS)
+			if err != nil {
+				return geoParquetMetadata{}, err
+			}
+			secondary.CRS = crs
+		}
+		columns[name] = secondary
 	}
 	return geoParquetMetadata{
 		Version:       geoParquetVersion,
 		PrimaryColumn: geoParquetGeometryColumn,
-		Columns:       map[string]geoParquetColumn{geoParquetGeometryColumn: column},
+		Columns:       columns,
 	}, nil
 }
 
-func buildGeoParquetRow(schema *parquet.Schema, feature encodedGeoParquetFeature, kinds map[string]geoParquetPropertyKind, propertyColumns map[string]string, geometryEncoding string) (parquet.Row, error) {
+func buildGeoParquetRow(schema *parquet.Schema, feature encodedGeoParquetFeature, kinds map[string]geoParquetPropertyKind, propertyColumns map[string]string, geometryEncoding string, geometryProperties []string) (parquet.Row, error) {
 	columnValues := make([][]parquet.Value, len(schema.Columns()))
 	for index, path := range schema.Columns() {
 		leaf, exists := schema.Lookup(path...)
@@ -397,14 +762,27 @@ func buildGeoParquetRow(schema *parquet.Schema, feature encodedGeoParquetFeature
 		}
 		columnValues[index] = []parquet.Value{parquet.NullValue().Level(0, 0, leaf.ColumnIndex)}
 	}
-	if geometryEncoding == "wkb" {
+	if feature.Geometry != nil && geometryEncoding == "wkb" {
 		index, leaf, err := geoParquetLeaf(schema, geoParquetGeometryColumn)
 		if err != nil {
 			return nil, err
 		}
 		columnValues[index] = []parquet.Value{parquet.ByteArrayValue(feature.GeometryWKB).Level(0, leaf.MaxDefinitionLevel, index)}
-	} else if err := setNativeGeoParquetGeometry(schema, columnValues, feature.Geometry); err != nil {
-		return nil, err
+	} else if feature.Geometry != nil {
+		if err := setNativeGeoParquetGeometry(schema, columnValues, feature.Geometry); err != nil {
+			return nil, err
+		}
+	}
+	for _, name := range geometryProperties {
+		if feature.SecondaryGeometries[name] == nil {
+			continue
+		}
+		if err := setGeoParquetColumn(schema, columnValues, name, parquet.ByteArrayValue(feature.SecondaryWKB[name])); err != nil {
+			return nil, err
+		}
+	}
+	if feature.Geometry == nil && len(feature.Bounds) != 0 {
+		return nil, fmt.Errorf("null primary geometry unexpectedly has covering bounds")
 	}
 	if feature.Feature.ID != nil {
 		if err := setGeoParquetColumn(schema, columnValues, geoParquetIDColumn, parquet.ByteArrayValue(feature.Feature.ID)); err != nil {
@@ -451,8 +829,12 @@ func buildGeoParquetRow(schema *parquet.Schema, feature encodedGeoParquetFeature
 			return nil, err
 		}
 	}
-	if err := setGeoParquetBounds(schema, columnValues, feature.Bounds); err != nil {
-		return nil, err
+	if len(feature.Bounds) > 0 {
+		if _, exists := schema.Lookup(geoParquetCoveringColumn, "xmin"); exists {
+			if err := setGeoParquetBounds(schema, columnValues, feature.Bounds); err != nil {
+				return nil, err
+			}
+		}
 	}
 	var row parquet.Row
 	for _, values := range columnValues {
@@ -524,24 +906,34 @@ func geoParquetLeaf(schema *parquet.Schema, path ...string) (int, parquet.LeafCo
 }
 
 func nativeGeoParquetType(features []encodedGeoParquetFeature) (string, int, error) {
-	if len(features) == 0 {
-		return "", 2, fmt.Errorf("native GeoParquet encoding requires at least one Feature so its geometry schema can be determined")
+	firstIndex := -1
+	for index := range features {
+		if features[index].Geometry != nil {
+			firstIndex = index
+			break
+		}
 	}
-	firstType, err := geoParquetGeometryType(features[0].Geometry)
+	if firstIndex == -1 {
+		return "", 2, fmt.Errorf("native GeoParquet encoding requires at least one non-null geometry so its schema can be determined")
+	}
+	firstType, err := geoParquetGeometryType(features[firstIndex].Geometry)
 	if err != nil {
 		return "", 0, err
 	}
 	if firstType == "GeometryCollection" {
 		return "", 0, fmt.Errorf("native GeoParquet encoding does not support GeometryCollection; use WKB encoding")
 	}
-	dimension := features[0].Geometry.Stride()
-	for index := 1; index < len(features); index++ {
+	dimension := features[firstIndex].Geometry.Stride()
+	for index := firstIndex + 1; index < len(features); index++ {
+		if features[index].Geometry == nil {
+			continue
+		}
 		geometryType, err := geoParquetGeometryType(features[index].Geometry)
 		if err != nil {
 			return "", 0, err
 		}
 		if geometryType != firstType || features[index].Geometry.Stride() != dimension {
-			return "", 0, fmt.Errorf("native GeoParquet encoding requires one geometry type and coordinate dimension; Feature 1 is %s %dD while Feature %d is %s %dD", firstType, dimension, index+1, geometryType, features[index].Geometry.Stride())
+			return "", 0, fmt.Errorf("native GeoParquet encoding requires one geometry type and coordinate dimension; Feature %d is %s %dD while Feature %d is %s %dD", firstIndex+1, firstType, dimension, index+1, geometryType, features[index].Geometry.Stride())
 		}
 	}
 	return stringsLower(firstType), dimension, nil

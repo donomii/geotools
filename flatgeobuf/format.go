@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,13 +14,13 @@ import (
 	gogamafgb "github.com/gogama/flatgeobuf/flatgeobuf"
 	"github.com/gogama/flatgeobuf/flatgeobuf/flat"
 	flatbuffers "github.com/google/flatbuffers/go"
-	"github.com/paulmach/orb"
-	"github.com/paulmach/orb/geojson"
+	"github.com/twpayne/go-geom"
+	geomjson "github.com/twpayne/go-geom/encoding/geojson"
 )
 
 type flatSourceFeature struct {
 	Feature     geodata.Feature
-	Geometry    orb.Geometry
+	Geometry    geom.T
 	Properties  map[string]json.RawMessage
 	FeatureJSON []byte
 }
@@ -195,7 +196,7 @@ func writeFlatProperty(writer *gogamafgb.PropWriter, column flatColumn, raw json
 	}
 }
 
-func buildFlatHeader(layerName string, columns []flatColumn, features []flatSourceFeature, indexed bool) (*flat.Header, error) {
+func buildFlatHeader(layerName string, columns []flatColumn, features []flatSourceFeature, indexed bool, crs string, dimension int) (*flat.Header, error) {
 	builder := flatbuffers.NewBuilder(1024)
 	columnOffsets := make([]flatbuffers.UOffsetT, len(columns))
 	for index, column := range columns {
@@ -216,26 +217,49 @@ func buildFlatHeader(layerName string, columns []flatColumn, features []flatSour
 	var envelopeOffset flatbuffers.UOffsetT
 	geometryType := flat.GeometryTypeUnknown
 	if len(features) > 0 {
-		bounds := features[0].Geometry.Bound()
+		bounds := features[0].Geometry.Bounds()
 		geometryType = flatGeometryType(features[0].Geometry)
 		for _, feature := range features[1:] {
-			bounds = bounds.Union(feature.Geometry.Bound())
+			bounds.Extend(feature.Geometry)
 			if flatGeometryType(feature.Geometry) != geometryType {
 				geometryType = flat.GeometryTypeUnknown
 			}
 		}
-		envelope := []float64{bounds.Min[0], bounds.Min[1], bounds.Max[0], bounds.Max[1]}
+		envelope := []float64{bounds.Min(0), bounds.Min(1), bounds.Max(0), bounds.Max(1)}
 		flat.HeaderStartEnvelopeVector(builder, len(envelope))
 		for index := len(envelope) - 1; index >= 0; index-- {
 			builder.PrependFloat64(envelope[index])
 		}
 		envelopeOffset = builder.EndVector(len(envelope))
 	}
-	orgOffset := builder.CreateString("EPSG")
-	nameOffset := builder.CreateString("WGS 84")
+	org := "EPSG"
+	code := 4326
+	codeString := ""
+	if crs == geodata.CRSCRS84h {
+		org, code, codeString = "OGC", 0, "CRS84h"
+	} else if crs != geodata.CRSCRS84 {
+		parts := strings.Split(crs, ":")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("FlatGeobuf CRS %q cannot be stored as an organization and code", crs)
+		}
+		parsed, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return nil, fmt.Errorf("FlatGeobuf CRS %q has a non-numeric EPSG code: %w", crs, err)
+		}
+		code = parsed
+	}
+	orgOffset := builder.CreateString(org)
+	nameOffset := builder.CreateString(crs)
+	var codeStringOffset flatbuffers.UOffsetT
+	if codeString != "" {
+		codeStringOffset = builder.CreateString(codeString)
+	}
 	flat.CrsStart(builder)
 	flat.CrsAddOrg(builder, orgOffset)
-	flat.CrsAddCode(builder, 4326)
+	flat.CrsAddCode(builder, int32(code))
+	if codeStringOffset != 0 {
+		flat.CrsAddCodeString(builder, codeStringOffset)
+	}
 	flat.CrsAddName(builder, nameOffset)
 	crsOffset := flat.CrsEnd(builder)
 	layerOffset := builder.CreateString(layerName)
@@ -245,6 +269,7 @@ func buildFlatHeader(layerName string, columns []flatColumn, features []flatSour
 		flat.HeaderAddEnvelope(builder, envelopeOffset)
 	}
 	flat.HeaderAddGeometryType(builder, geometryType)
+	flat.HeaderAddHasZ(builder, dimension == 3)
 	flat.HeaderAddColumns(builder, columnsOffset)
 	flat.HeaderAddFeaturesCount(builder, uint64(len(features)))
 	indexNodeSize := uint16(0)
@@ -258,59 +283,53 @@ func buildFlatHeader(layerName string, columns []flatColumn, features []flatSour
 	return flat.GetSizePrefixedRootAsHeader(builder.FinishedBytes(), 0), nil
 }
 
-func buildFlatGeometry(builder *flatbuffers.Builder, geometry orb.Geometry) (flatbuffers.UOffsetT, error) {
+func buildFlatGeometry(builder *flatbuffers.Builder, geometry geom.T) (flatbuffers.UOffsetT, error) {
 	switch value := geometry.(type) {
-	case orb.Point:
-		xyOffset := buildFlatXY(builder, []float64{value[0], value[1]})
-		return finishFlatGeometry(builder, flat.GeometryTypePoint, 0, xyOffset, 0), nil
-	case orb.MultiPoint:
-		xy := make([]float64, 0, len(value)*2)
-		for _, point := range value {
-			xy = append(xy, point[0], point[1])
-		}
-		xyOffset := buildFlatXY(builder, xy)
-		return finishFlatGeometry(builder, flat.GeometryTypeMultiPoint, 0, xyOffset, 0), nil
-	case orb.LineString:
-		xyOffset := buildFlatXY(builder, lineStringXY(value))
-		return finishFlatGeometry(builder, flat.GeometryTypeLineString, 0, xyOffset, 0), nil
-	case orb.MultiLineString:
-		xy, ends := multiLineXYEnds(value)
-		endsOffset := buildFlatEnds(builder, ends)
-		xyOffset := buildFlatXY(builder, xy)
-		return finishFlatGeometry(builder, flat.GeometryTypeMultiLineString, endsOffset, xyOffset, 0), nil
-	case orb.Polygon:
-		xy, ends := polygonXYEnds(value)
-		endsOffset := buildFlatEnds(builder, ends)
-		xyOffset := buildFlatXY(builder, xy)
-		return finishFlatGeometry(builder, flat.GeometryTypePolygon, endsOffset, xyOffset, 0), nil
-	case orb.MultiPolygon:
-		partOffsets := make([]flatbuffers.UOffsetT, len(value))
-		for index, polygon := range value {
-			offset, err := buildFlatGeometry(builder, polygon)
+	case *geom.Point, *geom.MultiPoint, *geom.LineString:
+		xy, z := flatCoordinateVectors(geometry)
+		xyOffset := buildFlatFloat64Vector(builder, xy, flat.GeometryStartXyVector)
+		zOffset := buildFlatFloat64Vector(builder, z, flat.GeometryStartZVector)
+		return finishFlatGeometry(builder, flatGeometryType(geometry), 0, xyOffset, zOffset, 0), nil
+	case *geom.MultiLineString:
+		xy, z := flatCoordinateVectors(geometry)
+		endsOffset := buildFlatEnds(builder, flatEnds(value.Ends(), geometry.Stride()))
+		xyOffset := buildFlatFloat64Vector(builder, xy, flat.GeometryStartXyVector)
+		zOffset := buildFlatFloat64Vector(builder, z, flat.GeometryStartZVector)
+		return finishFlatGeometry(builder, flat.GeometryTypeMultiLineString, endsOffset, xyOffset, zOffset, 0), nil
+	case *geom.Polygon:
+		xy, z := flatCoordinateVectors(geometry)
+		endsOffset := buildFlatEnds(builder, flatEnds(value.Ends(), geometry.Stride()))
+		xyOffset := buildFlatFloat64Vector(builder, xy, flat.GeometryStartXyVector)
+		zOffset := buildFlatFloat64Vector(builder, z, flat.GeometryStartZVector)
+		return finishFlatGeometry(builder, flat.GeometryTypePolygon, endsOffset, xyOffset, zOffset, 0), nil
+	case *geom.MultiPolygon:
+		partOffsets := make([]flatbuffers.UOffsetT, value.NumPolygons())
+		for index := 0; index < value.NumPolygons(); index++ {
+			offset, err := buildFlatGeometry(builder, value.Polygon(index))
 			if err != nil {
 				return 0, err
 			}
 			partOffsets[index] = offset
 		}
 		partsOffset := buildFlatParts(builder, partOffsets)
-		return finishFlatGeometry(builder, flat.GeometryTypeMultiPolygon, 0, 0, partsOffset), nil
-	case orb.Collection:
-		partOffsets := make([]flatbuffers.UOffsetT, len(value))
-		for index, child := range value {
-			offset, err := buildFlatGeometry(builder, child)
+		return finishFlatGeometry(builder, flat.GeometryTypeMultiPolygon, 0, 0, 0, partsOffset), nil
+	case *geom.GeometryCollection:
+		partOffsets := make([]flatbuffers.UOffsetT, value.NumGeoms())
+		for index := 0; index < value.NumGeoms(); index++ {
+			offset, err := buildFlatGeometry(builder, value.Geom(index))
 			if err != nil {
 				return 0, err
 			}
 			partOffsets[index] = offset
 		}
 		partsOffset := buildFlatParts(builder, partOffsets)
-		return finishFlatGeometry(builder, flat.GeometryTypeGeometryCollection, 0, 0, partsOffset), nil
+		return finishFlatGeometry(builder, flat.GeometryTypeGeometryCollection, 0, 0, 0, partsOffset), nil
 	default:
 		return 0, fmt.Errorf("unsupported geometry type %T", geometry)
 	}
 }
 
-func finishFlatGeometry(builder *flatbuffers.Builder, geometryType flat.GeometryType, ends, xy, parts flatbuffers.UOffsetT) flatbuffers.UOffsetT {
+func finishFlatGeometry(builder *flatbuffers.Builder, geometryType flat.GeometryType, ends, xy, z, parts flatbuffers.UOffsetT) flatbuffers.UOffsetT {
 	flat.GeometryStart(builder)
 	flat.GeometryAddType(builder, geometryType)
 	if ends != 0 {
@@ -319,18 +338,49 @@ func finishFlatGeometry(builder *flatbuffers.Builder, geometryType flat.Geometry
 	if xy != 0 {
 		flat.GeometryAddXy(builder, xy)
 	}
+	if z != 0 {
+		flat.GeometryAddZ(builder, z)
+	}
 	if parts != 0 {
 		flat.GeometryAddParts(builder, parts)
 	}
 	return flat.GeometryEnd(builder)
 }
 
-func buildFlatXY(builder *flatbuffers.Builder, values []float64) flatbuffers.UOffsetT {
-	flat.GeometryStartXyVector(builder, len(values))
+func buildFlatFloat64Vector(builder *flatbuffers.Builder, values []float64, start func(*flatbuffers.Builder, int) flatbuffers.UOffsetT) flatbuffers.UOffsetT {
+	if len(values) == 0 {
+		return 0
+	}
+	start(builder, len(values))
 	for index := len(values) - 1; index >= 0; index-- {
 		builder.PrependFloat64(values[index])
 	}
 	return builder.EndVector(len(values))
+}
+
+func flatCoordinateVectors(geometry geom.T) ([]float64, []float64) {
+	flatCoordinates := geometry.FlatCoords()
+	stride := geometry.Stride()
+	xy := make([]float64, 0, len(flatCoordinates)/stride*2)
+	var z []float64
+	if stride == 3 {
+		z = make([]float64, 0, len(flatCoordinates)/stride)
+	}
+	for offset := 0; offset < len(flatCoordinates); offset += stride {
+		xy = append(xy, flatCoordinates[offset], flatCoordinates[offset+1])
+		if stride == 3 {
+			z = append(z, flatCoordinates[offset+2])
+		}
+	}
+	return xy, z
+}
+
+func flatEnds(ends []int, stride int) []uint32 {
+	result := make([]uint32, len(ends))
+	for index, end := range ends {
+		result[index] = uint32(end / stride)
+	}
+	return result
 }
 
 func buildFlatEnds(builder *flatbuffers.Builder, values []uint32) flatbuffers.UOffsetT {
@@ -349,78 +399,65 @@ func buildFlatParts(builder *flatbuffers.Builder, values []flatbuffers.UOffsetT)
 	return builder.EndVector(len(values))
 }
 
-func lineStringXY(line orb.LineString) []float64 {
-	xy := make([]float64, 0, len(line)*2)
-	for _, point := range line {
-		xy = append(xy, point[0], point[1])
-	}
-	return xy
-}
-
-func multiLineXYEnds(lines orb.MultiLineString) ([]float64, []uint32) {
-	var xy []float64
-	ends := make([]uint32, 0, len(lines))
-	for _, line := range lines {
-		xy = append(xy, lineStringXY(line)...)
-		ends = append(ends, uint32(len(xy)/2))
-	}
-	return xy, ends
-}
-
-func polygonXYEnds(polygon orb.Polygon) ([]float64, []uint32) {
-	var xy []float64
-	ends := make([]uint32, 0, len(polygon))
-	for _, ring := range polygon {
-		for _, point := range ring {
-			xy = append(xy, point[0], point[1])
-		}
-		ends = append(ends, uint32(len(xy)/2))
-	}
-	return xy, ends
-}
-
-func flatGeometryType(geometry orb.Geometry) flat.GeometryType {
+func flatGeometryType(geometry geom.T) flat.GeometryType {
 	switch geometry.(type) {
-	case orb.Point:
+	case *geom.Point:
 		return flat.GeometryTypePoint
-	case orb.MultiPoint:
+	case *geom.MultiPoint:
 		return flat.GeometryTypeMultiPoint
-	case orb.LineString:
+	case *geom.LineString:
 		return flat.GeometryTypeLineString
-	case orb.MultiLineString:
+	case *geom.MultiLineString:
 		return flat.GeometryTypeMultiLineString
-	case orb.Polygon:
+	case *geom.Polygon:
 		return flat.GeometryTypePolygon
-	case orb.MultiPolygon:
+	case *geom.MultiPolygon:
 		return flat.GeometryTypeMultiPolygon
-	case orb.Collection:
+	case *geom.GeometryCollection:
 		return flat.GeometryTypeGeometryCollection
 	default:
 		return flat.GeometryTypeUnknown
 	}
 }
 
-func validateFlatCRS(header *flat.Header) error {
+func flatHeaderCRS(header *flat.Header) (string, error) {
 	var crs flat.Crs
 	if header.Crs(&crs) == nil {
-		return fmt.Errorf("FlatGeobuf header has no CRS; GeoJSON output requires WGS 84 longitude and latitude")
+		return "", fmt.Errorf("FlatGeobuf header has no CRS; GeoJSON output requires a CRS that can be reprojected to WGS 84")
 	}
-	isEPSG4326 := string(crs.Org()) == "EPSG" && crs.Code() == 4326
-	isCRS84 := string(crs.Org()) == "OGC" && (string(crs.CodeString()) == "CRS84" || string(crs.CodeString()) == "CRS84h")
-	if !isEPSG4326 && !isCRS84 {
-		return fmt.Errorf("FlatGeobuf CRS is organization %q numeric code %d string code %q; this converter requires EPSG:4326 or OGC:CRS84", crs.Org(), crs.Code(), crs.CodeString())
+	organization := string(crs.Org())
+	if organization == "EPSG" && crs.Code() != 0 {
+		normalized, err := geodata.NormalizeCRS(fmt.Sprintf("EPSG:%d", crs.Code()))
+		if err != nil {
+			return "", fmt.Errorf("FlatGeobuf CRS organization %q numeric code %d cannot be reprojected: %w", crs.Org(), crs.Code(), err)
+		}
+		return normalized, nil
 	}
-	return nil
+	if organization == "OGC" && len(crs.CodeString()) != 0 {
+		normalized, err := geodata.NormalizeCRS("OGC:" + string(crs.CodeString()))
+		if err != nil {
+			return "", fmt.Errorf("FlatGeobuf CRS organization %q string code %q cannot be reprojected: %w", crs.Org(), crs.CodeString(), err)
+		}
+		return normalized, nil
+	}
+	return "", fmt.Errorf("FlatGeobuf CRS is organization %q numeric code %d string code %q; expected a supported EPSG or OGC identifier", crs.Org(), crs.Code(), crs.CodeString())
 }
 
-func decodeFlatFeature(encoded *flat.Feature, header *flat.Header) (geodata.Feature, error) {
+func decodeFlatFeature(encoded *flat.Feature, header *flat.Header, sourceCRS string) (geodata.Feature, error) {
 	var flatGeometry flat.Geometry
 	if encoded.Geometry(&flatGeometry) == nil {
 		return geodata.Feature{}, fmt.Errorf("Feature has no geometry")
 	}
-	geometry, err := flatGeometryToOrb(&flatGeometry, header.GeometryType())
+	geometry, err := flatGeometryToGeom(&flatGeometry, header.GeometryType(), header.HasZ())
 	if err != nil {
 		return geodata.Feature{}, err
+	}
+	targetCRS := geodata.CRSCRS84
+	if geometry.Stride() == 3 {
+		targetCRS = geodata.CRSCRS84h
+	}
+	if _, err := geodata.TransformGeometry(geometry, sourceCRS, targetCRS); err != nil {
+		return geodata.Feature{}, fmt.Errorf("geometry cannot be reprojected from %s to %s: %w", sourceCRS, targetCRS, err)
 	}
 	properties, preserved, hasPreserved, err := decodeFlatProperties(encoded.PropertiesBytes(), header)
 	if err != nil {
@@ -431,16 +468,16 @@ func decodeFlatFeature(encoded *flat.Feature, header *flat.Header) (geodata.Feat
 		if err := json.Unmarshal([]byte(preserved), &feature); err != nil {
 			return geodata.Feature{}, fmt.Errorf("reserved property %q does not contain a valid Feature: %w", preservedFeatureProperty, err)
 		}
-		originalGeometry, err := geodata.OrbGeometry(feature.Geometry)
+		originalGeometry, err := geodata.DecodeGeomJSON(feature.Geometry)
 		if err != nil {
 			return geodata.Feature{}, fmt.Errorf("reserved property %q contains invalid geometry: %w", preservedFeatureProperty, err)
 		}
-		if !orb.Equal(originalGeometry, geometry) {
+		if !equalFlatGeometry(originalGeometry, geometry) {
 			return geodata.Feature{}, fmt.Errorf("FlatGeobuf geometry differs from the geometry in reserved property %q", preservedFeatureProperty)
 		}
 		return feature, nil
 	}
-	geometryJSON, err := json.Marshal(geojson.NewGeometry(geometry))
+	geometryJSON, err := geomjson.Marshal(geometry)
 	if err != nil {
 		return geodata.Feature{}, err
 	}
@@ -556,91 +593,78 @@ func errorsJoin(first, second error) error {
 	return second
 }
 
-func flatGeometryToOrb(geometry *flat.Geometry, inheritedType flat.GeometryType) (orb.Geometry, error) {
+func flatGeometryToGeom(geometry *flat.Geometry, inheritedType flat.GeometryType, hasZ bool) (geom.T, error) {
 	geometryType := geometry.Type()
 	if geometryType == flat.GeometryTypeUnknown {
 		geometryType = inheritedType
 	}
+	layout, coordinates, err := flatCoordinates(geometry, hasZ)
+	if err != nil {
+		return nil, err
+	}
+	stride := layout.Stride()
 	switch geometryType {
 	case flat.GeometryTypePoint:
-		points, err := flatPoints(geometry)
-		if err != nil {
-			return nil, err
+		if len(coordinates) != stride {
+			return nil, fmt.Errorf("Point contains %d positions; expected 1", len(coordinates)/stride)
 		}
-		if len(points) != 1 {
-			return nil, fmt.Errorf("Point contains %d positions; expected 1", len(points))
-		}
-		return points[0], nil
+		return geom.NewPointFlat(layout, coordinates), nil
 	case flat.GeometryTypeMultiPoint:
-		points, err := flatPoints(geometry)
-		return orb.MultiPoint(points), err
+		return geom.NewMultiPointFlat(layout, coordinates), nil
 	case flat.GeometryTypeLineString:
-		points, err := flatPoints(geometry)
-		return orb.LineString(points), err
+		return geom.NewLineStringFlat(layout, coordinates), nil
 	case flat.GeometryTypeMultiLineString:
-		points, err := flatPoints(geometry)
+		ends, err := flatGeomEnds(geometry, len(coordinates)/stride, stride)
 		if err != nil {
 			return nil, err
 		}
-		parts, err := flatPointParts(points, geometry)
-		if err != nil {
-			return nil, err
+		if len(ends) == 0 && len(coordinates) > 0 {
+			ends = []int{len(coordinates)}
 		}
-		if len(parts) == 0 && len(points) > 0 {
-			parts = [][]orb.Point{points}
-		}
-		lines := make(orb.MultiLineString, len(parts))
-		for index := range parts {
-			lines[index] = orb.LineString(parts[index])
-		}
-		return lines, nil
+		return geom.NewMultiLineStringFlat(layout, coordinates, ends), nil
 	case flat.GeometryTypePolygon:
-		points, err := flatPoints(geometry)
+		ends, err := flatGeomEnds(geometry, len(coordinates)/stride, stride)
 		if err != nil {
 			return nil, err
 		}
-		parts, err := flatPointParts(points, geometry)
-		if err != nil {
-			return nil, err
+		if len(ends) == 0 && len(coordinates) > 0 {
+			ends = []int{len(coordinates)}
 		}
-		if len(parts) == 0 && len(points) > 0 {
-			parts = [][]orb.Point{points}
-		}
-		polygon := make(orb.Polygon, len(parts))
-		for index := range parts {
-			polygon[index] = orb.Ring(parts[index])
-		}
-		return polygon, nil
+		return geom.NewPolygonFlat(layout, coordinates, ends), nil
 	case flat.GeometryTypeMultiPolygon:
-		polygons := make(orb.MultiPolygon, 0, geometry.PartsLength())
+		polygons := geom.NewMultiPolygon(layout)
 		for index := 0; index < geometry.PartsLength(); index++ {
 			var part flat.Geometry
 			if !geometry.Parts(&part, index) {
 				return nil, fmt.Errorf("MultiPolygon part %d is missing", index)
 			}
-			converted, err := flatGeometryToOrb(&part, flat.GeometryTypePolygon)
+			converted, err := flatGeometryToGeom(&part, flat.GeometryTypePolygon, hasZ)
 			if err != nil {
 				return nil, fmt.Errorf("MultiPolygon part %d is invalid: %w", index, err)
 			}
-			polygon, ok := converted.(orb.Polygon)
+			polygon, ok := converted.(*geom.Polygon)
 			if !ok {
 				return nil, fmt.Errorf("MultiPolygon part %d has type %T; expected Polygon", index, converted)
 			}
-			polygons = append(polygons, polygon)
+			if err := polygons.Push(polygon); err != nil {
+				return nil, err
+			}
 		}
 		return polygons, nil
 	case flat.GeometryTypeGeometryCollection:
-		collection := make(orb.Collection, 0, geometry.PartsLength())
+		collection := geom.NewGeometryCollection()
 		for index := 0; index < geometry.PartsLength(); index++ {
 			var part flat.Geometry
 			if !geometry.Parts(&part, index) {
 				return nil, fmt.Errorf("GeometryCollection part %d is missing", index)
 			}
-			converted, err := flatGeometryToOrb(&part, flat.GeometryTypeUnknown)
+			converted, err := flatGeometryToGeom(&part, flat.GeometryTypeUnknown, hasZ)
 			if err != nil {
 				return nil, fmt.Errorf("GeometryCollection part %d is invalid: %w", index, err)
 			}
-			collection = append(collection, converted)
+			if err := collection.Push(converted); err != nil {
+				return nil, err
+			}
 		}
 		return collection, nil
 	default:
@@ -648,33 +672,63 @@ func flatGeometryToOrb(geometry *flat.Geometry, inheritedType flat.GeometryType)
 	}
 }
 
-func flatPoints(geometry *flat.Geometry) ([]orb.Point, error) {
+func flatCoordinates(geometry *flat.Geometry, hasZ bool) (geom.Layout, []float64, error) {
 	if geometry.XyLength()%2 != 0 {
-		return nil, fmt.Errorf("geometry has %d XY values; expected an even count", geometry.XyLength())
+		return geom.NoLayout, nil, fmt.Errorf("geometry has %d XY values; expected an even count", geometry.XyLength())
 	}
-	points := make([]orb.Point, 0, geometry.XyLength()/2)
+	positionCount := geometry.XyLength() / 2
+	layout := geom.XY
+	if hasZ {
+		layout = geom.XYZ
+		if geometry.ZLength() != positionCount {
+			return geom.NoLayout, nil, fmt.Errorf("3D geometry has %d positions and %d Z values", positionCount, geometry.ZLength())
+		}
+	} else if geometry.ZLength() != 0 {
+		return geom.NoLayout, nil, fmt.Errorf("2D FlatGeobuf header accompanies %d unexpected Z values", geometry.ZLength())
+	}
+	coordinates := make([]float64, 0, positionCount*layout.Stride())
 	for index := 0; index < geometry.XyLength(); index += 2 {
-		points = append(points, orb.Point{geometry.Xy(index), geometry.Xy(index + 1)})
+		coordinates = append(coordinates, geometry.Xy(index), geometry.Xy(index+1))
+		if hasZ {
+			coordinates = append(coordinates, geometry.Z(index/2))
+		}
 	}
-	return points, nil
+	return layout, coordinates, nil
 }
 
-func flatPointParts(points []orb.Point, geometry *flat.Geometry) ([][]orb.Point, error) {
+func flatGeomEnds(geometry *flat.Geometry, positionCount, stride int) ([]int, error) {
 	if geometry.EndsLength() == 0 {
 		return nil, nil
 	}
-	parts := make([][]orb.Point, 0, geometry.EndsLength())
+	ends := make([]int, 0, geometry.EndsLength())
 	start := 0
 	for index := 0; index < geometry.EndsLength(); index++ {
 		end := int(geometry.Ends(index))
-		if end <= start || end > len(points) {
-			return nil, fmt.Errorf("geometry end %d is %d; expected a value above %d and at most %d", index, end, start, len(points))
+		if end <= start || end > positionCount {
+			return nil, fmt.Errorf("geometry end %d is %d; expected a value above %d and at most %d", index, end, start, positionCount)
 		}
-		parts = append(parts, points[start:end])
+		ends = append(ends, end*stride)
 		start = end
 	}
-	if start != len(points) {
-		return nil, fmt.Errorf("geometry ends at position %d but contains %d positions", start, len(points))
+	if start != positionCount {
+		return nil, fmt.Errorf("geometry ends at position %d but contains %d positions", start, positionCount)
 	}
-	return parts, nil
+	return ends, nil
+}
+
+func equalFlatGeometry(first, second geom.T) bool {
+	if reflect.TypeOf(first) != reflect.TypeOf(second) || first.Stride() != second.Stride() {
+		return false
+	}
+	firstCoordinates := first.FlatCoords()
+	secondCoordinates := second.FlatCoords()
+	if len(firstCoordinates) != len(secondCoordinates) {
+		return false
+	}
+	for index := range firstCoordinates {
+		if math.Abs(firstCoordinates[index]-secondCoordinates[index]) > 0.00002 {
+			return false
+		}
+	}
+	return true
 }

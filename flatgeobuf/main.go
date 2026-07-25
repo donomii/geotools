@@ -16,7 +16,6 @@ import (
 	"github.com/donomii/geotools/geodata"
 	gogamafgb "github.com/gogama/flatgeobuf/flatgeobuf"
 	"github.com/gogama/flatgeobuf/flatgeobuf/flat"
-	"github.com/gogama/flatgeobuf/packedrtree"
 )
 
 const preservedFeatureProperty = "__geotools_feature_json"
@@ -25,53 +24,50 @@ type flatEncodeSettings struct {
 	InputMode geodata.InputMode
 	LayerName string
 	Indexed   bool
+	CRS       string
+	Dimension int
 }
 
 func encodeFlatGeobuf(input io.Reader, output io.Writer, inputMode geodata.InputMode, layerName string) error {
-	return encodeFlatGeobufWithSettings(input, output, flatEncodeSettings{InputMode: inputMode, LayerName: layerName, Indexed: true})
+	return encodeFlatGeobufWithSettings(input, output, flatEncodeSettings{InputMode: inputMode, LayerName: layerName, Indexed: true, CRS: geodata.CRSCRS84})
 }
 
 func encodeFlatGeobufWithSettings(input io.Reader, output io.Writer, settings flatEncodeSettings) error {
 	if settings.LayerName == "" {
 		return fmt.Errorf("FlatGeobuf layer name is empty")
 	}
+	configuredCRS := settings.CRS
+	if configuredCRS == "" {
+		configuredCRS = geodata.CRSCRS84
+	}
+	targetCRS, err := geodata.NormalizeCRS(configuredCRS)
+	if err != nil {
+		return err
+	}
 	if !settings.Indexed {
-		return encodeStreamingFlatGeobuf(input, output, settings)
+		if settings.Dimension == 0 {
+			settings.Dimension = 2
+		}
+		if settings.Dimension != 2 && settings.Dimension != 3 {
+			return fmt.Errorf("streaming FlatGeobuf coordinate dimension is %d; expected 2 or 3", settings.Dimension)
+		}
+		return encodeStreamingFlatGeobuf(input, output, settings, targetCRS)
 	}
 	var sourceFeatures []flatSourceFeature
 	featureNumber := 0
-	err := geodata.ReadFeatures(input, settings.InputMode, func(feature geodata.Feature) error {
+	err = geodata.ReadFeatures(input, settings.InputMode, func(feature geodata.Feature) error {
 		featureNumber++
-		summary, err := geodata.ValidateFeature(feature, geodata.ValidationOptions{})
+		source, err := prepareFlatSourceFeature(feature, targetCRS)
 		if err != nil {
 			return fmt.Errorf("FlatGeobuf input Feature %d with id %s is invalid: %w", featureNumber, feature.EncodedID(), err)
 		}
-		if summary.CoordinateDimension != 2 {
-			return fmt.Errorf("FlatGeobuf input Feature %d with id %s has %d-coordinate positions; this converter supports 2D positions", featureNumber, feature.EncodedID(), summary.CoordinateDimension)
-		}
-		properties, err := feature.PropertyMap()
-		if err != nil {
-			return err
-		}
-		if _, exists := properties[preservedFeatureProperty]; exists {
-			return fmt.Errorf("Feature %d with id %s uses reserved property %q", featureNumber, feature.EncodedID(), preservedFeatureProperty)
-		}
-		featureJSON, err := json.Marshal(feature)
-		if err != nil {
-			return fmt.Errorf("failed to preserve Feature %s: %w", feature.EncodedID(), err)
-		}
-		geometry, err := geodata.OrbGeometry(feature.Geometry)
-		if err != nil {
-			return err
-		}
-		sourceFeatures = append(sourceFeatures, flatSourceFeature{
-			Feature:     feature,
-			Geometry:    geometry,
-			Properties:  properties,
-			FeatureJSON: featureJSON,
-		})
+		sourceFeatures = append(sourceFeatures, source)
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	dimension, err := flatFeatureDimension(sourceFeatures)
 	if err != nil {
 		return err
 	}
@@ -88,7 +84,7 @@ func encodeFlatGeobufWithSettings(input io.Reader, output io.Writer, settings fl
 		encodedFeatures = append(encodedFeatures, encoded)
 	}
 	indexed := len(sourceFeatures) > 0
-	header, err := buildFlatHeader(settings.LayerName, columns, sourceFeatures, indexed)
+	header, err := buildFlatHeader(settings.LayerName, columns, sourceFeatures, indexed, targetCRS, dimension)
 	if err != nil {
 		return err
 	}
@@ -109,9 +105,9 @@ func encodeFlatGeobufWithSettings(input io.Reader, output io.Writer, settings fl
 	return nil
 }
 
-func encodeStreamingFlatGeobuf(input io.Reader, output io.Writer, settings flatEncodeSettings) error {
+func encodeStreamingFlatGeobuf(input io.Reader, output io.Writer, settings flatEncodeSettings, targetCRS string) error {
 	columns := []flatColumn{{Name: preservedFeatureProperty, Type: flat.ColumnTypeString}}
-	header, err := buildFlatHeader(settings.LayerName, columns, nil, false)
+	header, err := buildFlatHeader(settings.LayerName, columns, nil, false, targetCRS, settings.Dimension)
 	if err != nil {
 		return err
 	}
@@ -122,31 +118,14 @@ func encodeStreamingFlatGeobuf(input io.Reader, output io.Writer, settings flatE
 	featureNumber := 0
 	readErr := geodata.ReadFeatures(input, settings.InputMode, func(feature geodata.Feature) error {
 		featureNumber++
-		summary, err := geodata.ValidateFeature(feature, geodata.ValidationOptions{})
+		source, err := prepareFlatSourceFeature(feature, targetCRS)
 		if err != nil {
 			return fmt.Errorf("FlatGeobuf input Feature %d with id %s is invalid: %w", featureNumber, feature.EncodedID(), err)
 		}
-		if summary.CoordinateDimension != 2 {
-			return fmt.Errorf("FlatGeobuf input Feature %d with id %s has %d-coordinate positions; this converter supports 2D positions", featureNumber, feature.EncodedID(), summary.CoordinateDimension)
+		if source.Geometry.Stride() != settings.Dimension {
+			return fmt.Errorf("FlatGeobuf input Feature %d with id %s is %dD; streaming header declares %dD coordinates", featureNumber, feature.EncodedID(), source.Geometry.Stride(), settings.Dimension)
 		}
-		properties, err := feature.PropertyMap()
-		if err != nil {
-			return err
-		}
-		featureJSON, err := json.Marshal(feature)
-		if err != nil {
-			return fmt.Errorf("failed to preserve Feature %s: %w", feature.EncodedID(), err)
-		}
-		geometry, err := geodata.OrbGeometry(feature.Geometry)
-		if err != nil {
-			return err
-		}
-		encoded, err := buildFlatFeature(flatSourceFeature{
-			Feature:     feature,
-			Geometry:    geometry,
-			Properties:  properties,
-			FeatureJSON: featureJSON,
-		}, columns)
+		encoded, err := buildFlatFeature(source, columns)
 		if err != nil {
 			return fmt.Errorf("failed to encode streaming FlatGeobuf Feature %d with id %s: %w", featureNumber, feature.EncodedID(), err)
 		}
@@ -164,30 +143,65 @@ func encodeStreamingFlatGeobuf(input io.Reader, output io.Writer, settings flatE
 	return nil
 }
 
+func flatFeatureDimension(features []flatSourceFeature) (int, error) {
+	dimension := 2
+	if len(features) > 0 {
+		dimension = features[0].Geometry.Stride()
+	}
+	for index := 1; index < len(features); index++ {
+		if features[index].Geometry.Stride() != dimension {
+			return 0, fmt.Errorf("FlatGeobuf requires one coordinate dimension; Feature 1 is %dD while Feature %d is %dD", dimension, index+1, features[index].Geometry.Stride())
+		}
+	}
+	return dimension, nil
+}
+
+func prepareFlatSourceFeature(feature geodata.Feature, targetCRS string) (flatSourceFeature, error) {
+	summary, err := geodata.ValidateFeature(feature, geodata.ValidationOptions{})
+	if err != nil {
+		return flatSourceFeature{}, err
+	}
+	if summary.CoordinateDimension != 2 && summary.CoordinateDimension != 3 {
+		return flatSourceFeature{}, fmt.Errorf("geometry has %d-coordinate positions; FlatGeobuf supports 2D or 3D positions", summary.CoordinateDimension)
+	}
+	properties, err := feature.PropertyMap()
+	if err != nil {
+		return flatSourceFeature{}, err
+	}
+	if _, exists := properties[preservedFeatureProperty]; exists {
+		return flatSourceFeature{}, fmt.Errorf("Feature uses reserved property %q", preservedFeatureProperty)
+	}
+	featureJSON, err := json.Marshal(feature)
+	if err != nil {
+		return flatSourceFeature{}, fmt.Errorf("failed to preserve Feature %s: %w", feature.EncodedID(), err)
+	}
+	geometry, err := geodata.DecodeGeomJSON(feature.Geometry)
+	if err != nil {
+		return flatSourceFeature{}, err
+	}
+	sourceCRS := geodata.CRSCRS84
+	if geometry.Stride() == 3 {
+		sourceCRS = geodata.CRSCRS84h
+	}
+	if _, err := geodata.TransformGeometry(geometry, sourceCRS, targetCRS); err != nil {
+		return flatSourceFeature{}, fmt.Errorf("geometry cannot be reprojected from %s to %s: %w", sourceCRS, targetCRS, err)
+	}
+	return flatSourceFeature{Feature: feature, Geometry: geometry, Properties: properties, FeatureJSON: featureJSON}, nil
+}
+
 func decodeFlatGeobuf(input io.Reader, output io.Writer, outputMode geodata.OutputMode) error {
 	return decodeFlatGeobufWithBBox(input, output, outputMode, nil)
 }
 
 func decodeFlatGeobufWithBBox(input io.Reader, output io.Writer, outputMode geodata.OutputMode, bbox *[4]float64) error {
-	data, err := io.ReadAll(input)
-	if err != nil {
-		return fmt.Errorf("failed to read FlatGeobuf input: %w", err)
-	}
-	if bbox != nil {
-		return decodeFlatGeobufBBox(bytes.NewReader(data), output, outputMode, *bbox)
-	}
-	reader := gogamafgb.NewFileReader(bytes.NewReader(data))
+	reader := gogamafgb.NewFileReader(struct{ io.Reader }{input})
 	header, err := reader.Header()
 	if err != nil {
 		return fmt.Errorf("input has an invalid FlatGeobuf header: %w", err)
 	}
-	if err := validateFlatCRS(header); err != nil {
+	sourceCRS, err := flatHeaderCRS(header)
+	if err != nil {
 		return err
-	}
-	if header.IndexNodeSize() > 0 {
-		if _, err := reader.Index(); err != nil {
-			return fmt.Errorf("failed to read FlatGeobuf spatial index: %w", err)
-		}
 	}
 	writer := geodata.NewFeatureWriter(output, outputMode)
 	if err := writer.Start(); err != nil {
@@ -200,7 +214,7 @@ func decodeFlatGeobufWithBBox(input io.Reader, output io.Writer, outputMode geod
 		count, err := reader.Data(buffer)
 		for index := 0; index < count; index++ {
 			featureNumber++
-			if writeErr := writeDecodedFlatFeature(&buffer[index], header, writer, featureNumber, nil); writeErr != nil {
+			if writeErr := writeDecodedFlatFeature(&buffer[index], header, sourceCRS, writer, featureNumber, bbox); writeErr != nil {
 				decodeErr = writeErr
 				break
 			}
@@ -216,51 +230,8 @@ func decodeFlatGeobufWithBBox(input io.Reader, output io.Writer, outputMode geod
 	return errors.Join(decodeErr, writer.Close())
 }
 
-func decodeFlatGeobufBBox(input io.Reader, output io.Writer, outputMode geodata.OutputMode, bbox [4]float64) error {
-	data, err := io.ReadAll(input)
-	if err != nil {
-		return fmt.Errorf("failed to read FlatGeobuf input for bbox query: %w", err)
-	}
-	reader := gogamafgb.NewFileReader(bytes.NewReader(data))
-	header, err := reader.Header()
-	if err != nil {
-		return fmt.Errorf("input has an invalid FlatGeobuf header: %w", err)
-	}
-	if err := validateFlatCRS(header); err != nil {
-		return err
-	}
-	var encodedFeatures []flat.Feature
-	if header.IndexNodeSize() > 0 && header.FeaturesCount() > 0 {
-		if _, err := reader.Index(); err != nil {
-			return fmt.Errorf("failed to read FlatGeobuf spatial index for bbox %v: %w", bbox, err)
-		}
-		if err := reader.Rewind(); err != nil {
-			return fmt.Errorf("failed to rewind FlatGeobuf spatial index for bbox %v: %w", bbox, err)
-		}
-		query := packedrtree.Box{XMin: bbox[0], YMin: bbox[1], XMax: bbox[2], YMax: bbox[3]}
-		encodedFeatures, err = reader.IndexSearch(query)
-	} else {
-		encodedFeatures, err = reader.DataRem()
-	}
-	if err != nil && err != io.EOF {
-		return fmt.Errorf("failed to query FlatGeobuf Features in bbox %v: %w", bbox, err)
-	}
-	writer := geodata.NewFeatureWriter(output, outputMode)
-	if err := writer.Start(); err != nil {
-		return err
-	}
-	var decodeErr error
-	for index := range encodedFeatures {
-		if err := writeDecodedFlatFeature(&encodedFeatures[index], header, writer, index+1, &bbox); err != nil {
-			decodeErr = err
-			break
-		}
-	}
-	return errors.Join(decodeErr, writer.Close())
-}
-
-func writeDecodedFlatFeature(encoded *flat.Feature, header *flat.Header, writer *geodata.FeatureWriter, featureNumber int, bbox *[4]float64) error {
-	feature, err := decodeFlatFeature(encoded, header)
+func writeDecodedFlatFeature(encoded *flat.Feature, header *flat.Header, sourceCRS string, writer *geodata.FeatureWriter, featureNumber int, bbox *[4]float64) error {
+	feature, err := decodeFlatFeature(encoded, header, sourceCRS)
 	if err != nil {
 		return fmt.Errorf("FlatGeobuf Feature %d is invalid: %w", featureNumber, err)
 	}
@@ -325,6 +296,8 @@ func main() {
 	outputName := flag.String("output", "jsonl", "GeoJSON output format for decode: jsonl writes one Feature per line, collection writes a FeatureCollection, and seq writes RFC 8142 records")
 	layerName := flag.String("layer", "features", "Layer name stored in encoded FlatGeobuf metadata")
 	indexed := flag.Bool("index", true, "Build a packed spatial index and native property columns while encoding; false streams immediately with exact Features in one JSON column")
+	outputCRS := flag.String("crs", geodata.CRSCRS84, "CRS for encoded FlatGeobuf coordinates; GeoJSON input is reprojected from WGS 84")
+	dimension := flag.Int("dimensions", 2, "Coordinate dimension declared by streaming output when -index=false: 2 or 3; indexed output infers it from the Features")
 	bboxValue := flag.String("bbox", "", "Decode only Features intersecting minLon,minLat,maxLon,maxLat; an indexed input is queried directly and an unindexed input is scanned")
 	runTest := flag.Bool("test", false, "Run an in-memory GeoJSON-to-FlatGeobuf-to-GeoJSON round-trip check and exit")
 	flag.Parse()
@@ -344,7 +317,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		settings := flatEncodeSettings{InputMode: inputMode, LayerName: *layerName, Indexed: *indexed}
+		settings := flatEncodeSettings{InputMode: inputMode, LayerName: *layerName, Indexed: *indexed, CRS: *outputCRS, Dimension: *dimension}
 		if err := encodeFlatGeobufWithSettings(os.Stdin, os.Stdout, settings); err != nil {
 			log.Fatal(err)
 		}

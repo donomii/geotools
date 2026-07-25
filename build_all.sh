@@ -32,6 +32,9 @@ go build -o bin/geofilter ./geofilter
 echo "Building geoparquet..."
 go build -o bin/geoparquet ./geoparquet
 
+echo "Building mbtiles..."
+go build -o bin/mbtiles ./mbtiles
+
 echo "Building flatgeobuf..."
 go build -o bin/flatgeobuf ./flatgeobuf
 

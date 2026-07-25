@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/donomii/geotools/geodata"
@@ -103,8 +104,19 @@ func TestVectorTileMultipleLayerCommandRoundTrip(t *testing.T) {
 func TestGeoParquetCommandRoundTrip(t *testing.T) {
 	input := readRealData(t)
 	encoded := runConverter(t, input, "./geoparquet", "-mode=encode")
-	output := runConverter(t, encoded, "./geoparquet", "-mode=decode", "-output=collection")
-	requireSameFeatures(t, input, output)
+	path := filepath.Join(t.TempDir(), "real.parquet")
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("go", "run", "./geoparquet", "-mode=decode", "-file="+path, "-output=collection")
+	var output bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		t.Fatalf("geoparquet decode failed: %v\n%s", err, stderr.Bytes())
+	}
+	requireSameFeatures(t, input, output.Bytes())
 }
 
 func TestFlatGeobufCommandRoundTrip(t *testing.T) {
@@ -209,6 +221,26 @@ func TestMBTilesCommandWritesQueryableArchive(t *testing.T) {
 	}
 	if name != "real places" || tileCount != 4 {
 		t.Fatalf("MBTiles archive has name %q and %d tiles; expected name %q and 4 tiles", name, tileCount, "real places")
+	}
+	inspectionData := runConverter(t, nil, "./mbtiles", "-mode=inspect", "-file="+path)
+	var inspection struct {
+		Metadata  map[string]string `json:"metadata"`
+		TileCount int               `json:"tile_count"`
+	}
+	if err := json.Unmarshal(inspectionData, &inspection); err != nil {
+		t.Fatal(err)
+	}
+	if inspection.TileCount != 4 || inspection.Metadata["name"] != "real places" ||
+		!strings.Contains(inspection.Metadata["json"], `"name":"String"`) {
+		t.Fatalf("mbtiles inspection is %#v", inspection)
+	}
+	var expectedTile []byte
+	if err := database.QueryRow(`SELECT tile_data FROM tiles WHERE zoom_level=0 AND tile_column=0 AND tile_row=0`).Scan(&expectedTile); err != nil {
+		t.Fatal(err)
+	}
+	extracted := runConverter(t, nil, "./mbtiles", "-mode=extract", "-file="+path, "-z=0", "-x=0", "-y=0")
+	if !bytes.Equal(extracted, expectedTile) {
+		t.Fatalf("mbtiles extraction returned %d bytes; expected %d exact bytes", len(extracted), len(expectedTile))
 	}
 }
 

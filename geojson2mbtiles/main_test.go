@@ -16,15 +16,11 @@ func TestMBTilesArchiveContainsDecodableTilesAndMetadata(t *testing.T) {
 		InputMode: geodata.InputAuto, Name: "real archive", Layer: "features", LayerProperty: "layer",
 		IDProperty: geodata.DefaultMVTIDProperty, MinZoom: 0, MaxZoom: 2, Extent: 4096, Buffer: 64, Simplify: 0, Gzip: true, MaxTiles: 100,
 	}
-	source, err := readArchiveSource(input, settings)
-	if err != nil {
-		t.Fatal(err)
-	}
 	database, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeMBTilesDatabase(database, source, settings); err != nil {
+	if err := writeMBTilesDatabase(database, input, settings); err != nil {
 		t.Fatal(err)
 	}
 	var name, metadataJSON string
@@ -36,6 +32,9 @@ func TestMBTilesArchiveContainsDecodableTilesAndMetadata(t *testing.T) {
 	}
 	if name != "real archive" || !bytes.Contains([]byte(metadataJSON), []byte(`"id":"places"`)) || !bytes.Contains([]byte(metadataJSON), []byte(`"id":"roads"`)) {
 		t.Fatalf("MBTiles metadata name=%q json=%s", name, metadataJSON)
+	}
+	if !bytes.Contains([]byte(metadataJSON), []byte(`"name":"String"`)) || !bytes.Contains([]byte(metadataJSON), []byte(`"__geotools_geojson_id":"String"`)) {
+		t.Fatalf("MBTiles field metadata is incomplete: %s", metadataJSON)
 	}
 	var zoom, column, row uint
 	var tileData []byte
@@ -66,6 +65,13 @@ func TestMBTilesArchiveContainsDecodableTilesAndMetadata(t *testing.T) {
 	if !ids[`"Q334"`] {
 		t.Fatalf("decoded MBTiles ids are %v; expected exact string id Q334", ids)
 	}
+	var stagingTables int
+	if err := database.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE '_geotools_%'`).Scan(&stagingTables); err != nil {
+		t.Fatal(err)
+	}
+	if stagingTables != 0 {
+		t.Fatalf("completed MBTiles archive retains %d staging tables", stagingTables)
+	}
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +83,12 @@ func TestMBTilesTileLimit(t *testing.T) {
 		InputMode: geodata.InputAuto, Name: "limited", Layer: "features", MinZoom: 4, MaxZoom: 4,
 		Extent: 4096, Buffer: 64, Simplify: 1, Gzip: true, MaxTiles: 2,
 	}
-	if _, err := readArchiveSource(input, settings); err == nil {
+	database, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := writeMBTilesDatabase(database, input, settings); err == nil {
 		t.Fatal("accepted an archive exceeding its tile limit")
 	}
 }
@@ -88,7 +99,12 @@ func TestMBTilesRejectsConflictingReservedPropertiesBeforeWriting(t *testing.T) 
 		InputMode: geodata.InputAuto, Name: "conflict", Layer: "features", LayerProperty: "routing",
 		IDProperty: "routing", MinZoom: 0, MaxZoom: 0, Extent: 4096, Buffer: 64, Simplify: 1, Gzip: true, MaxTiles: 10,
 	}
-	if _, err := readArchiveSource(input, settings); err == nil {
+	database, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := writeMBTilesDatabase(database, input, settings); err == nil {
 		t.Fatal("accepted one property for both layer selection and exact id preservation")
 	}
 }

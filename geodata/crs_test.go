@@ -16,6 +16,8 @@ func TestParseCRSReferences(t *testing.T) {
 		`{"type":"Reference","href":"https://www.opengis.net/def/crs/EPSG/0/3857"}`: CRSEPSG3857,
 		`{"type":"ProjectedCRS","id":{"authority":"EPSG","code":3857}}`:             CRSEPSG3857,
 		`{"id":{"authority":"EPSG","code":"4979"}}`:                                 CRSCRS84h,
+		`{"type":"ProjectedCRS","id":{"authority":"EPSG","code":32648}}`:            "EPSG:32648",
+		`"https://www.opengis.net/def/crs/EPSG/0/27700"`:                            CRSEPSG27700,
 	}
 	for input, expected := range cases {
 		actual, err := ParseCRS(json.RawMessage(input))
@@ -30,7 +32,7 @@ func TestParseCRSReferences(t *testing.T) {
 
 func TestParseCRSRejectsUnsupportedAndIncompleteReferences(t *testing.T) {
 	cases := []string{
-		`"EPSG:32648"`,
+		`"EPSG:32661"`,
 		`{"type":"GeographicCRS","href":"http://www.opengis.net/def/crs/EPSG/0/4326"}`,
 		`{"type":"Reference"}`,
 		`{"id":{"authority":"EPSG","code":null}}`,
@@ -39,6 +41,42 @@ func TestParseCRSRejectsUnsupportedAndIncompleteReferences(t *testing.T) {
 		if _, err := ParseCRS(json.RawMessage(input)); err == nil {
 			t.Fatalf("accepted invalid CRS %s", input)
 		}
+	}
+}
+
+func TestBroaderProjectedCRSRoundTrips(t *testing.T) {
+	cases := []struct {
+		name      string
+		crs       string
+		longitude float64
+		latitude  float64
+		tolerance float64
+		minX      float64
+		maxX      float64
+		minY      float64
+		maxY      float64
+	}{
+		{name: "utm-north", crs: "EPSG:32648", longitude: 103.8198, latitude: 1.3521, tolerance: 1e-8, minX: 360000, maxX: 380000, minY: 140000, maxY: 160000},
+		{name: "utm-south", crs: "EPSG:32756", longitude: 151.2093, latitude: -33.8688, tolerance: 1e-8, minX: 320000, maxX: 350000, minY: 6240000, maxY: 6270000},
+		{name: "world-mercator", crs: CRSEPSG3395, longitude: 2.2945, latitude: 48.8584, tolerance: 1e-8, minX: 250000, maxX: 260000, minY: 6200000, maxY: 6250000},
+		{name: "british-national-grid", crs: CRSEPSG27700, longitude: -0.1246, latitude: 51.5007, tolerance: 2e-5, minX: 529000, maxX: 531000, minY: 179000, maxY: 181000},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			point := geom.NewPointFlat(geom.XY, []float64{testCase.longitude, testCase.latitude})
+			if _, err := TransformGeometry(point, CRSCRS84, testCase.crs); err != nil {
+				t.Fatal(err)
+			}
+			if point.X() < testCase.minX || point.X() > testCase.maxX || point.Y() < testCase.minY || point.Y() > testCase.maxY {
+				t.Fatalf("%s projected coordinate is %v", testCase.crs, point.FlatCoords())
+			}
+			if _, err := TransformGeometry(point, testCase.crs, CRSCRS84); err != nil {
+				t.Fatal(err)
+			}
+			if math.Abs(point.X()-testCase.longitude) > testCase.tolerance || math.Abs(point.Y()-testCase.latitude) > testCase.tolerance {
+				t.Fatalf("%s round trip returned %v", testCase.crs, point.FlatCoords())
+			}
+		})
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -18,6 +19,9 @@ func decodeGeoParquetGeometry(values [][]parquet.Value, paths [][]string, primar
 				geometryBytes, err := singleParquetBytes(values[index], primaryColumn)
 				if err != nil {
 					return nil, err
+				}
+				if geometryBytes == nil {
+					return nil, nil
 				}
 				geometry, err := geomwkb.Unmarshal(geometryBytes)
 				if err != nil {
@@ -39,6 +43,9 @@ func decodeGeoParquetGeometry(values [][]parquet.Value, paths [][]string, primar
 				axes[name] = nonNullParquetValues(values[index])
 			}
 		}
+	}
+	if len(axes["x"]) == 0 && len(axes["y"]) == 0 {
+		return nil, nil
 	}
 	if len(axes["x"]) == 0 || len(axes["x"]) != len(axes["y"]) {
 		return nil, fmt.Errorf("native %s geometry has %d x values and %d y values", encoding, len(axes["x"]), len(axes["y"]))
@@ -148,7 +155,7 @@ func nativeGeoParquetEndss(repetitions []int, stride int) [][]int {
 	return append(result, polygonEnds)
 }
 
-func decodeGeotoolsGeoParquetFeature(values [][]parquet.Value, paths [][]string, schema *parquet.Schema, geometry json.RawMessage, metadata geoParquetToolMetadata) (geodata.Feature, error) {
+func decodeGeotoolsGeoParquetFeature(values [][]parquet.Value, paths [][]string, schema *parquet.Schema, geometry json.RawMessage, secondaryGeometries map[string]json.RawMessage, metadata geoParquetToolMetadata) (geodata.Feature, error) {
 	feature := geodata.Feature{Type: "Feature", Geometry: append(json.RawMessage(nil), geometry...)}
 	if raw, err := geoParquetRootColumnJSON(values, paths, schema, metadata.IDColumn); err != nil {
 		return geodata.Feature{}, err
@@ -170,12 +177,38 @@ func decodeGeotoolsGeoParquetFeature(values [][]parquet.Value, paths [][]string,
 	if feature.Foreign == nil {
 		feature.Foreign = make(map[string]json.RawMessage)
 	}
-	propertiesNull, err := geoParquetRootColumnBool(values, paths, metadata.PropertiesNullColumn)
-	if err != nil {
-		return geodata.Feature{}, err
-	}
 	properties := make(map[string]json.RawMessage)
-	if !propertiesNull {
+	if metadata.PropertiesColumn != "" {
+		raw, err := geoParquetRootColumnJSON(values, paths, schema, metadata.PropertiesColumn)
+		if err != nil {
+			return geodata.Feature{}, err
+		}
+		if raw == nil {
+			return geodata.Feature{}, fmt.Errorf("column %q is null; expected a JSON object or JSON null", metadata.PropertiesColumn)
+		}
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			if len(secondaryGeometries) != 0 {
+				return geodata.Feature{}, fmt.Errorf("secondary geometry columns cannot be restored because column %q contains null properties", metadata.PropertiesColumn)
+			}
+			feature.Properties = json.RawMessage("null")
+		} else {
+			if err := json.Unmarshal(raw, &properties); err != nil {
+				return geodata.Feature{}, fmt.Errorf("column %q is not a JSON object: %w", metadata.PropertiesColumn, err)
+			}
+			for name, geometry := range secondaryGeometries {
+				if _, exists := properties[name]; exists {
+					return geodata.Feature{}, fmt.Errorf("secondary geometry column %q conflicts with the JSON properties column", name)
+				}
+				properties[name] = geometry
+			}
+			feature.Properties, err = json.Marshal(properties)
+			if err != nil {
+				return geodata.Feature{}, err
+			}
+		}
+	} else if propertiesNull, err := geoParquetRootColumnBool(values, paths, metadata.PropertiesNullColumn); err != nil {
+		return geodata.Feature{}, err
+	} else if !propertiesNull {
 		for propertyName, columnName := range metadata.PropertyColumns {
 			raw, err := geoParquetRootColumnJSON(values, paths, schema, columnName)
 			if err != nil {
@@ -198,14 +231,23 @@ func decodeGeotoolsGeoParquetFeature(values [][]parquet.Value, paths [][]string,
 				properties[name] = json.RawMessage("null")
 			}
 		}
+		for name, geometry := range secondaryGeometries {
+			if _, exists := properties[name]; exists {
+				return geodata.Feature{}, fmt.Errorf("secondary geometry column %q conflicts with a regular property column", name)
+			}
+			properties[name] = geometry
+		}
 		feature.Properties, err = json.Marshal(properties)
 		if err != nil {
 			return geodata.Feature{}, err
 		}
 	} else {
+		if len(secondaryGeometries) != 0 {
+			return geodata.Feature{}, fmt.Errorf("secondary geometry columns cannot be restored because geotools metadata marks Feature properties as null")
+		}
 		feature.Properties = json.RawMessage("null")
 	}
-	if _, err := geodata.ValidateFeature(feature, geodata.ValidationOptions{}); err != nil {
+	if _, err := geodata.ValidateFeature(feature, geodata.ValidationOptions{AllowNullGeometry: true}); err != nil {
 		return geodata.Feature{}, err
 	}
 	return feature, nil
@@ -253,8 +295,20 @@ func geoParquetRootColumnBool(values [][]parquet.Value, paths [][]string, name s
 }
 
 func geoParquetCoveringPath(metadata geoParquetColumn, path []string) bool {
+	if metadata.Covering == nil {
+		return false
+	}
 	for _, coveringPath := range metadata.Covering.BBox {
 		if reflect.DeepEqual(path, coveringPath) {
+			return true
+		}
+	}
+	return false
+}
+
+func geoParquetGeometryMetadataPath(metadata geoParquetMetadata, path []string) bool {
+	for name, column := range metadata.Columns {
+		if path[0] == name || geoParquetCoveringPath(column, path) {
 			return true
 		}
 	}
