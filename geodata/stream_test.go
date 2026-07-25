@@ -3,6 +3,7 @@ package geodata
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"reflect"
 	"strings"
@@ -78,6 +79,46 @@ func TestSequenceRejectsMultipleValuesInOneRecord(t *testing.T) {
 		`{"type":"Feature","geometry":{"type":"Point","coordinates":[3,4]},"properties":{}}` + "\n"
 	if err := ReadFeatures(strings.NewReader(input), InputSequence, func(feature Feature) error { return nil }); err == nil {
 		t.Fatal("accepted two JSON values in one sequence record")
+	}
+}
+
+func TestAutoDetectsSequenceAfterLeadingWhitespace(t *testing.T) {
+	input := " \n\t\x1e" + `{"type":"Feature","id":"one","geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}` + "\n"
+	features := readFeaturesForTest(t, []byte(input), InputAuto)
+	if len(features) != 1 || features[0].EncodedID() != `"one"` {
+		t.Fatalf("auto-detected sequence returned %#v", features)
+	}
+}
+
+func TestReadFeaturesAcceptsMultipleTopLevelFeatures(t *testing.T) {
+	input := `{"type":"Feature","id":1,"geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}` + "\n" +
+		`{"type":"Feature","id":2,"geometry":{"type":"Point","coordinates":[3,4]},"properties":{}}` + "\n"
+	features := readFeaturesForTest(t, []byte(input), InputAuto)
+	if len(features) != 2 || features[0].EncodedID() != "1" || features[1].EncodedID() != "2" {
+		t.Fatalf("JSONL returned %#v", features)
+	}
+}
+
+func TestReadFeaturesReturnsVisitorError(t *testing.T) {
+	expected := errors.New("visitor rejected Feature")
+	input := strings.NewReader(`{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`)
+	err := ReadFeatures(input, InputAuto, func(feature Feature) error {
+		return expected
+	})
+	if !errors.Is(err, expected) {
+		t.Fatalf("visitor error became %q", err)
+	}
+}
+
+func TestReadFeaturesRejectsInvalidFeaturesMembers(t *testing.T) {
+	for _, input := range []string{
+		`{"type":"FeatureCollection","features":null}`,
+		`{"type":"FeatureCollection","features":{}}`,
+		`{"features":"not an array","type":"FeatureCollection"}`,
+	} {
+		if err := ReadFeatures(strings.NewReader(input), InputAuto, func(feature Feature) error { return nil }); err == nil {
+			t.Fatalf("accepted invalid FeatureCollection %s", input)
+		}
 	}
 }
 

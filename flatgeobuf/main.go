@@ -169,10 +169,14 @@ func decodeFlatGeobuf(input io.Reader, output io.Writer, outputMode geodata.Outp
 }
 
 func decodeFlatGeobufWithBBox(input io.Reader, output io.Writer, outputMode geodata.OutputMode, bbox *[4]float64) error {
-	if bbox != nil {
-		return decodeFlatGeobufBBox(input, output, outputMode, *bbox)
+	data, err := io.ReadAll(input)
+	if err != nil {
+		return fmt.Errorf("failed to read FlatGeobuf input: %w", err)
 	}
-	reader := gogamafgb.NewFileReader(input)
+	if bbox != nil {
+		return decodeFlatGeobufBBox(bytes.NewReader(data), output, outputMode, *bbox)
+	}
+	reader := gogamafgb.NewFileReader(bytes.NewReader(data))
 	header, err := reader.Header()
 	if err != nil {
 		return fmt.Errorf("input has an invalid FlatGeobuf header: %w", err)
