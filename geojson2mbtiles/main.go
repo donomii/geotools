@@ -17,7 +17,10 @@ import (
 
 	"github.com/donomii/geotools/geodata"
 	"github.com/paulmach/orb"
+	"github.com/paulmach/orb/encoding/mvt"
+	"github.com/paulmach/orb/geojson"
 	"github.com/paulmach/orb/maptile"
+	"github.com/paulmach/orb/simplify"
 	_ "modernc.org/sqlite"
 )
 
@@ -147,6 +150,7 @@ func writeMBTilesDatabase(database *sql.DB, input io.Reader, settings archiveSet
 	}
 	var previousTile *archiveTile
 	tileIndex := 0
+	writtenTileCount := 0
 	for {
 		tile, exists, err := nextStagedArchiveTile(transaction, previousTile)
 		if err != nil {
@@ -170,12 +174,21 @@ func writeMBTilesDatabase(database *sql.DB, input io.Reader, settings archiveSet
 			Simplify: settings.Simplify, Gzip: settings.Gzip, LayerProperty: settings.LayerProperty, DropLayerProperty: settings.DropLayerProperty,
 			IDProperty: settings.IDProperty,
 		}
-		encodeErr := geodata.EncodeMVT(features, &encoded, geodata.InputAuto, tileSettings)
+		encodedFeatureCount, encodeErr := geodata.EncodeMVTWithFeatureCount(features, &encoded, geodata.InputAuto, tileSettings)
 		closeErr := features.Close()
 		if encodeErr != nil || closeErr != nil {
 			_ = insert.Close()
 			_ = transaction.Rollback()
 			return fmt.Errorf("failed to encode MBTiles tile %d/%d/%d (%d of %d): %w", tile.Z, tile.X, tile.Y, tileIndex, source.TileCount, errors.Join(encodeErr, closeErr))
+		}
+		previousTile = &tile
+		if encodedFeatureCount == 0 {
+			continue
+		}
+		if writtenTileCount == settings.MaxTiles {
+			_ = insert.Close()
+			_ = transaction.Rollback()
+			return fmt.Errorf("MBTiles input produces more than %d non-empty tiles from zoom %d through %d; increase -max-tiles or reduce the zoom range", settings.MaxTiles, settings.MinZoom, settings.MaxZoom)
 		}
 		tmsY := (uint64(1) << tile.Z) - 1 - uint64(tile.Y)
 		if _, err := insert.Exec(tile.Z, tile.X, tmsY, encoded.Bytes()); err != nil {
@@ -183,7 +196,7 @@ func writeMBTilesDatabase(database *sql.DB, input io.Reader, settings archiveSet
 			_ = transaction.Rollback()
 			return fmt.Errorf("failed to store MBTiles tile %d/%d/%d with TMS row %d: %w", tile.Z, tile.X, tile.Y, tmsY, err)
 		}
-		previousTile = &tile
+		writtenTileCount++
 	}
 	if tileIndex != source.TileCount {
 		_ = insert.Close()
@@ -192,7 +205,7 @@ func writeMBTilesDatabase(database *sql.DB, input io.Reader, settings archiveSet
 	}
 	if err := insert.Close(); err != nil {
 		_ = transaction.Rollback()
-		return fmt.Errorf("failed to close MBTiles tile insertion after %d tiles: %w", tileIndex, err)
+		return fmt.Errorf("failed to close MBTiles tile insertion after %d non-empty tiles: %w", writtenTileCount, err)
 	}
 	for _, table := range []string{"_geotools_tile_features", "_geotools_tiles", "_geotools_features"} {
 		if _, err := transaction.Exec(`DROP TABLE ` + table); err != nil {
@@ -201,7 +214,7 @@ func writeMBTilesDatabase(database *sql.DB, input io.Reader, settings archiveSet
 		}
 	}
 	if err := transaction.Commit(); err != nil {
-		return fmt.Errorf("failed to commit MBTiles archive containing %d tiles: %w", tileIndex, err)
+		return fmt.Errorf("failed to commit MBTiles archive containing %d non-empty tiles: %w", writtenTileCount, err)
 	}
 	return nil
 }
@@ -263,33 +276,76 @@ func stageArchiveSource(transaction *sql.Tx, input io.Reader, settings archiveSe
 			source.Bounds[2] = math.Max(source.Bounds[2], summary.Bounds[2])
 			source.Bounds[3] = math.Max(source.Bounds[3], summary.Bounds[3])
 		}
-		for zoom := settings.MinZoom; zoom <= settings.MaxZoom; zoom++ {
-			northwest := maptile.At(orb.Point{summary.Bounds[0], summary.Bounds[3]}, maptile.Zoom(zoom))
-			southeast := maptile.At(orb.Point{summary.Bounds[2], summary.Bounds[1]}, maptile.Zoom(zoom))
-			for x := northwest.X; x <= southeast.X; x++ {
-				for y := northwest.Y; y <= southeast.Y; y++ {
-					result, err := tileInsert.Exec(zoom, x, y)
-					if err != nil {
-						return fmt.Errorf("failed to stage MBTiles tile %d/%d/%d for Feature %d with id %s: %w", zoom, x, y, source.FeatureCount, feature.EncodedID(), err)
-					}
-					added, err := result.RowsAffected()
-					if err != nil {
-						return fmt.Errorf("failed to count staged MBTiles tile %d/%d/%d: %w", zoom, x, y, err)
-					}
-					source.TileCount += int(added)
-					if source.TileCount > settings.MaxTiles {
-						return fmt.Errorf("MBTiles input covers more than %d tiles from zoom %d through %d; increase -max-tiles or reduce the zoom range", settings.MaxTiles, settings.MinZoom, settings.MaxZoom)
-					}
-					if _, err := mappingInsert.Exec(zoom, x, y, source.FeatureCount); err != nil {
-						return fmt.Errorf("failed to map MBTiles tile %d/%d/%d to Feature %d with id %s: %w", zoom, x, y, source.FeatureCount, feature.EncodedID(), err)
-					}
-				}
-			}
+		geometry, err := geodata.OrbGeometry(feature.Geometry)
+		if err != nil {
+			return fmt.Errorf("failed to prepare MBTiles input Feature %d with id %s for tile coverage: %w", source.FeatureCount, feature.EncodedID(), err)
+		}
+		if err := stageArchiveFeatureTiles(tileInsert, mappingInsert, geometry, source.FeatureCount, feature.EncodedID(), settings, &source); err != nil {
+			return err
 		}
 		return nil
 	})
 	closeErr := errors.Join(featureInsert.Close(), tileInsert.Close(), mappingInsert.Close())
 	return source, errors.Join(readErr, closeErr)
+}
+
+func stageArchiveFeatureTiles(tileInsert, mappingInsert *sql.Stmt, geometry orb.Geometry, featureID int, encodedID string, settings archiveSettings, source *archiveSource) error {
+	return stageArchiveFeatureTile(tileInsert, mappingInsert, geometry, featureID, encodedID, archiveTile{}, settings, source)
+}
+
+func stageArchiveFeatureTile(tileInsert, mappingInsert *sql.Stmt, geometry orb.Geometry, featureID int, encodedID string, tile archiveTile, settings archiveSettings, source *archiveSource) error {
+	if !archiveGeometryIntersectsTile(geometry, tile, settings, 0) {
+		return nil
+	}
+	if tile.Z >= settings.MinZoom {
+		contributes := settings.Simplify == 0 || archiveGeometryIntersectsTile(geometry, tile, settings, settings.Simplify)
+		if contributes {
+			result, err := tileInsert.Exec(tile.Z, tile.X, tile.Y)
+			if err != nil {
+				return fmt.Errorf("failed to stage MBTiles tile %d/%d/%d for Feature %d with id %s: %w", tile.Z, tile.X, tile.Y, featureID, encodedID, err)
+			}
+			added, err := result.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("failed to count staged MBTiles tile %d/%d/%d: %w", tile.Z, tile.X, tile.Y, err)
+			}
+			source.TileCount += int(added)
+			if source.TileCount > settings.MaxTiles {
+				return fmt.Errorf("MBTiles input produces more than %d non-empty tiles from zoom %d through %d; increase -max-tiles or reduce the zoom range", settings.MaxTiles, settings.MinZoom, settings.MaxZoom)
+			}
+			if _, err := mappingInsert.Exec(tile.Z, tile.X, tile.Y, featureID); err != nil {
+				return fmt.Errorf("failed to map MBTiles tile %d/%d/%d to Feature %d with id %s: %w", tile.Z, tile.X, tile.Y, featureID, encodedID, err)
+			}
+		}
+	}
+	if tile.Z == settings.MaxZoom {
+		return nil
+	}
+	childZoom := tile.Z + 1
+	for xOffset := uint(0); xOffset < 2; xOffset++ {
+		for yOffset := uint(0); yOffset < 2; yOffset++ {
+			child := archiveTile{Z: childZoom, X: tile.X*2 + xOffset, Y: tile.Y*2 + yOffset}
+			if err := stageArchiveFeatureTile(tileInsert, mappingInsert, geometry, featureID, encodedID, child, settings, source); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func archiveGeometryIntersectsTile(geometry orb.Geometry, tile archiveTile, settings archiveSettings, tolerance float64) bool {
+	feature := geojson.NewFeature(orb.Clone(geometry))
+	collection := geojson.NewFeatureCollection()
+	collection.Append(feature)
+	layer := mvt.NewLayer(settings.Layer, collection)
+	layer.Extent = uint32(settings.Extent)
+	layer.ProjectToTile(maptile.New(uint32(tile.X), uint32(tile.Y), maptile.Zoom(tile.Z)))
+	if tolerance > 0 {
+		layer.Simplify(simplify.DouglasPeucker(tolerance))
+	}
+	extent := float64(settings.Extent)
+	buffer := float64(settings.Buffer)
+	layer.Clip(orb.Bound{Min: orb.Point{-buffer, -buffer}, Max: orb.Point{extent + buffer, extent + buffer}})
+	return len(layer.Features) != 0
 }
 
 func nextStagedArchiveTile(transaction *sql.Tx, previous *archiveTile) (archiveTile, bool, error) {
@@ -466,8 +522,8 @@ func runBuiltInTest() error {
 	if err := database.QueryRow(`SELECT count(*) FROM tiles`).Scan(&tileCount); err != nil {
 		return err
 	}
-	if tileCount != 2 {
-		return fmt.Errorf("MBTiles built-in check wrote %d tiles; expected 2", tileCount)
+	if tileCount != 5 {
+		return fmt.Errorf("MBTiles built-in check wrote %d tiles; expected 5 buffered tiles", tileCount)
 	}
 	return database.Close()
 }

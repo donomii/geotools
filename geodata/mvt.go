@@ -18,24 +18,29 @@ import (
 )
 
 func EncodeMVT(input io.Reader, output io.Writer, inputMode InputMode, settings MVTEncodeSettings) error {
+	_, err := EncodeMVTWithFeatureCount(input, output, inputMode, settings)
+	return err
+}
+
+func EncodeMVTWithFeatureCount(input io.Reader, output io.Writer, inputMode InputMode, settings MVTEncodeSettings) (int, error) {
 	tile, err := validateMVTTile(settings.Zoom, settings.X, settings.Y)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if settings.Layer == "" {
-		return fmt.Errorf("MVT layer name is empty")
+		return 0, fmt.Errorf("MVT layer name is empty")
 	}
 	if settings.Extent < 256 || settings.Extent > uint(^uint32(0)) {
-		return fmt.Errorf("MVT extent %d is outside supported range 256 through %d", settings.Extent, uint(^uint32(0)))
+		return 0, fmt.Errorf("MVT extent %d is outside supported range 256 through %d", settings.Extent, uint(^uint32(0)))
 	}
 	if settings.Buffer > settings.Extent {
-		return fmt.Errorf("MVT buffer %d exceeds extent %d", settings.Buffer, settings.Extent)
+		return 0, fmt.Errorf("MVT buffer %d exceeds extent %d", settings.Buffer, settings.Extent)
 	}
 	if settings.Simplify < 0 {
-		return fmt.Errorf("MVT simplification tolerance %v is negative", settings.Simplify)
+		return 0, fmt.Errorf("MVT simplification tolerance %v is negative", settings.Simplify)
 	}
 	if settings.IDProperty != "" && settings.IDProperty == settings.LayerProperty {
-		return fmt.Errorf("MVT id property %q is also the layer-selection property; use distinct property names", settings.IDProperty)
+		return 0, fmt.Errorf("MVT id property %q is also the layer-selection property; use distinct property names", settings.IDProperty)
 	}
 	collections := make(map[string]*geojson.FeatureCollection)
 	featureNumber := 0
@@ -89,7 +94,7 @@ func EncodeMVT(input io.Reader, output io.Writer, inputMode InputMode, settings 
 		collection.Append(converted)
 		return nil
 	}); err != nil {
-		return err
+		return 0, err
 	}
 	if len(collections) == 0 {
 		collections[settings.Layer] = geojson.NewFeatureCollection()
@@ -102,6 +107,7 @@ func EncodeMVT(input io.Reader, output io.Writer, inputMode InputMode, settings 
 	layers := make(mvt.Layers, 0, len(layerNames))
 	extent := float64(settings.Extent)
 	buffer := float64(settings.Buffer)
+	encodedFeatureCount := 0
 	for _, name := range layerNames {
 		layer := mvt.NewLayer(name, collections[name])
 		layer.Extent = uint32(settings.Extent)
@@ -113,6 +119,7 @@ func EncodeMVT(input io.Reader, output io.Writer, inputMode InputMode, settings 
 		for _, feature := range layer.Features {
 			normalizeMVTPolygonWinding(feature.Geometry)
 		}
+		encodedFeatureCount += len(layer.Features)
 		layers = append(layers, layer)
 	}
 	var encoded []byte
@@ -122,16 +129,16 @@ func EncodeMVT(input io.Reader, output io.Writer, inputMode InputMode, settings 
 		encoded, err = mvt.Marshal(layers)
 	}
 	if err != nil {
-		return fmt.Errorf("failed to encode tile %d/%d/%d: %w", settings.Zoom, settings.X, settings.Y, err)
+		return 0, fmt.Errorf("failed to encode tile %d/%d/%d: %w", settings.Zoom, settings.X, settings.Y, err)
 	}
 	written, err := output.Write(encoded)
 	if err != nil {
-		return fmt.Errorf("failed to write tile %d/%d/%d: %w", settings.Zoom, settings.X, settings.Y, err)
+		return 0, fmt.Errorf("failed to write tile %d/%d/%d: %w", settings.Zoom, settings.X, settings.Y, err)
 	}
 	if written != len(encoded) {
-		return fmt.Errorf("failed to write tile %d/%d/%d: wrote %d of %d bytes: %w", settings.Zoom, settings.X, settings.Y, written, len(encoded), io.ErrShortWrite)
+		return 0, fmt.Errorf("failed to write tile %d/%d/%d: wrote %d of %d bytes: %w", settings.Zoom, settings.X, settings.Y, written, len(encoded), io.ErrShortWrite)
 	}
-	return nil
+	return encodedFeatureCount, nil
 }
 
 func preserveMVTFeatureID(feature *Feature, propertyName string, featureNumber int) error {

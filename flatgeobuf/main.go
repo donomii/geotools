@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -278,9 +279,7 @@ func decodeFlatGeobufWithBBox(input io.Reader, output io.Writer, outputMode geod
 			if err != nil {
 				return errors.Join(fmt.Errorf("failed to search the FlatGeobuf packed index: %w", err), writer.Close())
 			}
-			sort.Slice(indexedMatches, func(first, second int) bool {
-				return indexedMatches[first].RefIndex < indexedMatches[second].RefIndex
-			})
+			sort.Sort(indexedMatches)
 			if len(indexedMatches) == 0 {
 				return writer.Close()
 			}
@@ -290,13 +289,29 @@ func decodeFlatGeobufWithBBox(input io.Reader, output io.Writer, outputMode geod
 	featureNumber := 0
 	matchNumber := 0
 	matchedAll := false
+	featureOffset := int64(0)
 	buffer := make([]flat.Feature, 64)
 	for {
 		count, err := reader.Data(buffer)
 		for index := 0; index < count; index++ {
 			featureNumber++
 			if indexedMatches != nil {
-				if indexedMatches[matchNumber].RefIndex != featureNumber-1 {
+				encodedSize, sizeErr := flatFeatureEncodedSize(&buffer[index])
+				if sizeErr != nil {
+					decodeErr = fmt.Errorf("FlatGeobuf Feature %d size cannot be determined: %w", featureNumber, sizeErr)
+					break
+				}
+				currentOffset := featureOffset
+				if encodedSize > math.MaxInt64-featureOffset {
+					decodeErr = fmt.Errorf("FlatGeobuf data offset overflows after Feature %d", featureNumber)
+					break
+				}
+				featureOffset += encodedSize
+				if indexedMatches[matchNumber].Offset < currentOffset {
+					decodeErr = fmt.Errorf("FlatGeobuf packed-index match %d has data offset %d between Feature records before offset %d", matchNumber+1, indexedMatches[matchNumber].Offset, currentOffset)
+					break
+				}
+				if indexedMatches[matchNumber].Offset != currentOffset {
 					continue
 				}
 				matchNumber++
@@ -322,6 +337,19 @@ func decodeFlatGeobufWithBBox(input io.Reader, output io.Writer, outputMode geod
 		decodeErr = fmt.Errorf("FlatGeobuf data ended after %d Features before all %d packed-index matches were found", featureNumber, len(indexedMatches))
 	}
 	return errors.Join(decodeErr, writer.Close())
+}
+
+func flatFeatureEncodedSize(feature *flat.Feature) (int64, error) {
+	data := feature.Table().Bytes
+	if len(data) < 4 {
+		return 0, fmt.Errorf("size-prefixed buffer contains %d bytes; expected at least 4", len(data))
+	}
+	payloadSize := binary.LittleEndian.Uint32(data[:4])
+	encodedSize := int64(payloadSize) + 4
+	if payloadSize == 0 || encodedSize > int64(len(data)) {
+		return 0, fmt.Errorf("size prefix declares %d payload bytes but the buffer contains %d bytes", payloadSize, len(data))
+	}
+	return encodedSize, nil
 }
 
 func flatGeobufReader(input io.Reader) (io.Reader, io.ReadSeeker, int64) {
@@ -385,12 +413,10 @@ func flatIndexSearchBox(bbox [4]float64, sourceCRS string) (packedrtree.Box, boo
 }
 
 func uniqueFlatResults(results packedrtree.Results) packedrtree.Results {
-	sort.Slice(results, func(first, second int) bool {
-		return results[first].RefIndex < results[second].RefIndex
-	})
+	sort.Sort(results)
 	writeIndex := 0
 	for _, result := range results {
-		if writeIndex == 0 || result.RefIndex != results[writeIndex-1].RefIndex {
+		if writeIndex == 0 || result.Offset != results[writeIndex-1].Offset {
 			results[writeIndex] = result
 			writeIndex++
 		}

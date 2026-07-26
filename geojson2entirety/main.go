@@ -161,32 +161,40 @@ var errEntiretyLimitReached = errors.New("Entirety conversion limit reached")
 
 func forEachEntiretyFeature(input io.Reader, visit func(entiretyFeature) error) error {
 	decoder := json.NewDecoder(input)
+	valueNumber := 0
 	for {
 		token, err := decoder.Token()
 		if err == io.EOF {
+			if valueNumber == 0 {
+				return fmt.Errorf("GeoJSON input is empty")
+			}
 			return nil
 		} else if err != nil {
 			return fmt.Errorf("failed to decode GeoJSON input: %w", err)
 		}
-		if err := visitEntiretyToken(decoder, token, visit); err != nil {
+		valueNumber++
+		if err := visitEntiretyToken(decoder, token, visit, true, true); err != nil {
 			return err
 		}
 	}
 }
 
-func visitEntiretyToken(decoder *json.Decoder, token json.Token, visit func(entiretyFeature) error) error {
+func visitEntiretyToken(decoder *json.Decoder, token json.Token, visit func(entiretyFeature) error, allowArray, allowCollection bool) error {
 	delimiter, ok := token.(json.Delim)
 	if !ok {
 		return fmt.Errorf("unsupported top-level JSON value %v; expected a GeoJSON object or array", token)
 	}
 	switch delimiter {
 	case '[':
+		if !allowArray {
+			return fmt.Errorf("GeoJSON Feature arrays cannot contain nested arrays")
+		}
 		for decoder.More() {
 			elementToken, err := decoder.Token()
 			if err != nil {
 				return fmt.Errorf("failed to decode GeoJSON array element: %w", err)
 			}
-			if err := visitEntiretyToken(decoder, elementToken, visit); err != nil {
+			if err := visitEntiretyToken(decoder, elementToken, visit, false, false); err != nil {
 				return err
 			}
 		}
@@ -201,6 +209,9 @@ func visitEntiretyToken(decoder *json.Decoder, token json.Token, visit func(enti
 	case '{':
 		var feature entiretyFeature
 		featuresSeen := false
+		featuresStreamed := false
+		var deferredFeatures json.RawMessage
+		seen := make(map[string]bool)
 		for decoder.More() {
 			keyToken, err := decoder.Token()
 			if err != nil {
@@ -210,48 +221,62 @@ func visitEntiretyToken(decoder *json.Decoder, token json.Token, visit func(enti
 			if !ok {
 				return fmt.Errorf("GeoJSON object key has type %T; expected string", keyToken)
 			}
+			if seen[key] {
+				return fmt.Errorf("GeoJSON object contains duplicate member %q", key)
+			}
+			seen[key] = true
 			switch key {
 			case "type":
 				if err := decoder.Decode(&feature.Type); err != nil {
 					return fmt.Errorf("failed to decode GeoJSON type: %w", err)
 				}
 			case "geometry":
-				if err := decoder.Decode(&feature.Geometry); err != nil {
+				var raw json.RawMessage
+				if err := decoder.Decode(&raw); err != nil {
+					return fmt.Errorf("failed to decode GeoJSON geometry: %w", err)
+				}
+				if err := validateEntiretyJSONMembers(raw); err != nil {
+					return fmt.Errorf("GeoJSON geometry is invalid: %w", err)
+				}
+				if err := json.Unmarshal(raw, &feature.Geometry); err != nil {
 					return fmt.Errorf("failed to decode GeoJSON geometry: %w", err)
 				}
 			case "properties":
-				if err := decoder.Decode(&feature.Properties); err != nil {
+				var raw json.RawMessage
+				if err := decoder.Decode(&raw); err != nil {
+					return fmt.Errorf("failed to decode GeoJSON properties: %w", err)
+				}
+				if err := validateEntiretyJSONMembers(raw); err != nil {
+					return fmt.Errorf("GeoJSON properties are invalid: %w", err)
+				}
+				if err := json.Unmarshal(raw, &feature.Properties); err != nil {
 					return fmt.Errorf("failed to decode GeoJSON properties: %w", err)
 				}
 			case "features":
 				featuresSeen = true
-				arrayStart, err := decoder.Token()
-				if err != nil {
-					return fmt.Errorf("failed to decode FeatureCollection features: %w", err)
-				}
-				if arrayStart != json.Delim('[') {
-					return fmt.Errorf("FeatureCollection features is %v; expected an array", arrayStart)
-				}
-				for decoder.More() {
-					featureStart, err := decoder.Token()
-					if err != nil {
-						return fmt.Errorf("failed to decode FeatureCollection Feature: %w", err)
+				if feature.Type == "FeatureCollection" {
+					if !allowCollection {
+						return fmt.Errorf("GeoJSON Feature array contains a FeatureCollection")
 					}
-					if err := visitEntiretyToken(decoder, featureStart, visit); err != nil {
+					if err := visitEntiretyFeatureArray(decoder, visit); err != nil {
 						return err
 					}
-				}
-				arrayEnd, err := decoder.Token()
-				if err != nil {
-					return fmt.Errorf("failed to close FeatureCollection features: %w", err)
-				}
-				if arrayEnd != json.Delim(']') {
-					return fmt.Errorf("FeatureCollection features ended with %v instead of ]", arrayEnd)
+					featuresStreamed = true
+				} else {
+					if err := decoder.Decode(&deferredFeatures); err != nil {
+						return fmt.Errorf("failed to decode GeoJSON features member: %w", err)
+					}
+					if err := validateEntiretyJSONMembers(deferredFeatures); err != nil {
+						return fmt.Errorf("GeoJSON features member is invalid: %w", err)
+					}
 				}
 			default:
 				var ignored json.RawMessage
 				if err := decoder.Decode(&ignored); err != nil {
 					return fmt.Errorf("failed to decode GeoJSON field %q: %w", key, err)
+				}
+				if err := validateEntiretyJSONMembers(ignored); err != nil {
+					return fmt.Errorf("GeoJSON field %q is invalid: %w", key, err)
 				}
 			}
 		}
@@ -263,14 +288,131 @@ func visitEntiretyToken(decoder *json.Decoder, token json.Token, visit func(enti
 			return fmt.Errorf("GeoJSON object ended with %v instead of }", end)
 		}
 		if feature.Type == "Feature" {
+			if !seen["geometry"] {
+				return fmt.Errorf("GeoJSON Feature is missing geometry")
+			}
+			if !seen["properties"] {
+				return fmt.Errorf("GeoJSON Feature is missing properties")
+			}
 			return visit(feature)
 		} else if feature.Type == "FeatureCollection" && featuresSeen {
+			if !allowCollection {
+				return fmt.Errorf("GeoJSON Feature array contains a FeatureCollection")
+			}
+			if !featuresStreamed {
+				featuresDecoder := json.NewDecoder(bytes.NewReader(deferredFeatures))
+				if err := visitEntiretyFeatureArray(featuresDecoder, visit); err != nil {
+					return err
+				}
+				if token, err := featuresDecoder.Token(); err != io.EOF {
+					if err != nil {
+						return err
+					}
+					return fmt.Errorf("FeatureCollection features has trailing token %v", token)
+				}
+			}
 			return nil
 		}
 		return fmt.Errorf("unsupported GeoJSON object type %q; expected Feature or FeatureCollection", feature.Type)
 	default:
 		return fmt.Errorf("unexpected JSON delimiter %q", delimiter)
 	}
+}
+
+func visitEntiretyFeatureArray(decoder *json.Decoder, visit func(entiretyFeature) error) error {
+	arrayStart, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("failed to decode FeatureCollection features: %w", err)
+	}
+	if arrayStart != json.Delim('[') {
+		return fmt.Errorf("FeatureCollection features is %v; expected an array", arrayStart)
+	}
+	for decoder.More() {
+		featureStart, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("failed to decode FeatureCollection Feature: %w", err)
+		}
+		if err := visitEntiretyToken(decoder, featureStart, visit, false, false); err != nil {
+			return err
+		}
+	}
+	arrayEnd, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("failed to close FeatureCollection features: %w", err)
+	}
+	if arrayEnd != json.Delim(']') {
+		return fmt.Errorf("FeatureCollection features ended with %v instead of ]", arrayEnd)
+	}
+	return nil
+}
+
+func validateEntiretyJSONMembers(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := validateEntiretyJSONValue(decoder); err != nil {
+		return err
+	}
+	if token, err := decoder.Token(); err != io.EOF {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("JSON value has trailing token %v", token)
+	}
+	return nil
+}
+
+func validateEntiretyJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, isDelimiter := token.(json.Delim)
+	if !isDelimiter {
+		return nil
+	}
+	if delimiter == '[' {
+		for decoder.More() {
+			if err := validateEntiretyJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if end != json.Delim(']') {
+			return fmt.Errorf("JSON array ended with %v instead of ]", end)
+		}
+		return nil
+	}
+	if delimiter != '{' {
+		return fmt.Errorf("unexpected JSON delimiter %q", delimiter)
+	}
+	seen := make(map[string]bool)
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return fmt.Errorf("JSON object key has type %T; expected string", keyToken)
+		}
+		if seen[key] {
+			return fmt.Errorf("JSON object contains duplicate member %q", key)
+		}
+		seen[key] = true
+		if err := validateEntiretyJSONValue(decoder); err != nil {
+			return err
+		}
+	}
+	end, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if end != json.Delim('}') {
+		return fmt.Errorf("JSON object ended with %v instead of }", end)
+	}
+	return nil
 }
 
 func entiretyPoint(feature entiretyFeature) (float64, float64, string, bool, error) {

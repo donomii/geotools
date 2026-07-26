@@ -178,6 +178,98 @@ func TestFlatGeobufBBoxQueryUsesProjectedIndex(t *testing.T) {
 	}
 }
 
+func TestFlatGeobufBBoxQueryUsesFeatureOffsets(t *testing.T) {
+	input := []byte(`{"type":"FeatureCollection","features":[
+		{"type":"Feature","geometry":{"type":"Point","coordinates":[-150,-60]},"properties":{"name":"southwest"}},
+		{"type":"Feature","geometry":{"type":"Point","coordinates":[150,-60]},"properties":{"name":"southeast"}},
+		{"type":"Feature","geometry":{"type":"Point","coordinates":[-150,60]},"properties":{"name":"northwest"}},
+		{"type":"Feature","geometry":{"type":"Point","coordinates":[150,60]},"properties":{"name":"northeast"}}
+	]}`)
+	var sources []flatSourceFeature
+	if err := geodata.ReadFeatures(bytes.NewReader(input), geodata.InputAuto, func(feature geodata.Feature) error {
+		source, err := prepareFlatSourceFeature(feature, geodata.CRSCRS84)
+		if err == nil {
+			sources = append(sources, source)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	columns, err := inferFlatColumns(sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedFeatures := make([]flat.Feature, 0, len(sources))
+	for _, source := range sources {
+		encoded, err := buildFlatFeature(source, columns)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encodedFeatures = append(encodedFeatures, encoded)
+	}
+	encodedFeatures = sortFlatFeaturesForIndex(sources, encodedFeatures)
+	for left, right := 0, len(encodedFeatures)-1; left < right; left, right = left+1, right-1 {
+		encodedFeatures[left], encodedFeatures[right] = encodedFeatures[right], encodedFeatures[left]
+	}
+	header, err := buildFlatHeader("unsorted", columns, sources, true, geodata.CRSCRS84, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	fileWriter := gogamafgb.NewFileWriter(writerWithoutClose{&encoded})
+	if _, err := fileWriter.Header(header); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fileWriter.IndexData(encodedFeatures); err != nil {
+		t.Fatal(err)
+	}
+	if err := fileWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	queries := []struct {
+		name string
+		bbox [4]float64
+	}{
+		{name: "southwest", bbox: [4]float64{-151, -61, -149, -59}},
+		{name: "southeast", bbox: [4]float64{149, -61, 151, -59}},
+		{name: "northwest", bbox: [4]float64{-151, 59, -149, 61}},
+		{name: "northeast", bbox: [4]float64{149, 59, 151, 61}},
+	}
+	for _, query := range queries {
+		for _, seekable := range []bool{true, false} {
+			mode := map[bool]string{true: "seekable", false: "stream"}[seekable]
+			t.Run(query.name+"/"+mode, func(t *testing.T) {
+				var input io.Reader = struct{ io.Reader }{bytes.NewReader(encoded.Bytes())}
+				if seekable {
+					input = bytes.NewReader(encoded.Bytes())
+				}
+				var output bytes.Buffer
+				if err := decodeFlatGeobufWithBBox(input, &output, geodata.OutputCollection, &query.bbox); err != nil {
+					t.Fatal(err)
+				}
+				var names []string
+				if err := geodata.ReadFeatures(&output, geodata.InputAuto, func(feature geodata.Feature) error {
+					properties, err := feature.PropertyMap()
+					if err != nil {
+						return err
+					}
+					var name string
+					if err := json.Unmarshal(properties["name"], &name); err != nil {
+						return err
+					}
+					names = append(names, name)
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if len(names) != 1 || names[0] != query.name {
+					t.Fatalf("bbox query returned names %v; expected %s", names, query.name)
+				}
+			})
+		}
+	}
+}
+
 func TestFlatGeobufBBoxQueryCrossesAntimeridian(t *testing.T) {
 	input := []byte(`{"type":"FeatureCollection","features":[
 		{"type":"Feature","geometry":{"type":"Point","coordinates":[175,1]},"properties":{"name":"east"}},

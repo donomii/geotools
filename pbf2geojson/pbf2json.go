@@ -146,6 +146,7 @@ func convertPBF(config settings, output io.Writer) (result error) {
 	if !masks.RelWays.Empty() || !masks.RelRelation.Empty() {
 		for {
 			relationCount := masks.RelRelation.Len()
+			wayCount := masks.RelWays.Len()
 			if err := rewind(file); err != nil {
 				return err
 			}
@@ -157,7 +158,7 @@ func convertPBF(config settings, output io.Writer) (result error) {
 			if err := indexRelationMembers(idxRelationsDecoder, masks, config); err != nil {
 				return err
 			}
-			if masks.RelRelation.Len() == relationCount {
+			if masks.RelRelation.Len() == relationCount && masks.RelWays.Len() == wayCount {
 				break
 			}
 		}
@@ -642,6 +643,7 @@ type relationWay struct {
 	Role        string
 	WayID       int64
 	Coordinates [][]float64
+	Tags        map[string]string
 }
 
 func newRelationFeature(cache pbfFeatureCache, relation *osmpbf.Relation, relations map[int64]*osmpbf.Relation) (geoJSONFeature, error) {
@@ -658,11 +660,16 @@ func newRelationFeature(cache pbfFeatureCache, relation *osmpbf.Relation, relati
 		if err != nil {
 			return geoJSONFeature{}, fmt.Errorf("failed to denormalize relation %d member way %d: %w", relation.ID, ways[index].WayID, err)
 		}
+		tags, err := cache.LookupWayTags(ways[index].WayID)
+		if err != nil {
+			return geoJSONFeature{}, fmt.Errorf("failed to restore relation %d member way %d tags: %w", relation.ID, ways[index].WayID, err)
+		}
 		coordinates, err := coordinatesFromLatLons(latlons)
 		if err != nil {
 			return geoJSONFeature{}, fmt.Errorf("failed to decode relation %d member way %d: %w", relation.ID, ways[index].WayID, err)
 		}
 		ways[index].Coordinates = coordinates
+		ways[index].Tags = tags
 	}
 
 	var geometry geoJSONGeometry
@@ -773,7 +780,7 @@ func multipolygonGeometry(ways []relationWay) (geoJSONGeometry, error) {
 func relationGeometry(cache pbfFeatureCache, ways []relationWay, nodeIDs []int64) (geoJSONGeometry, error) {
 	geometries := make([]geoJSONGeometry, 0, len(ways)+len(nodeIDs))
 	for _, way := range ways {
-		geometry, err := geometryFromCoordinates(way.Coordinates, nil)
+		geometry, err := geometryFromCoordinates(way.Coordinates, way.Tags)
 		if err != nil {
 			return geoJSONGeometry{}, err
 		}

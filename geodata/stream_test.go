@@ -140,6 +140,8 @@ func TestReadFeaturesRejectsInvalidTopLevelValues(t *testing.T) {
 	cases := []string{
 		"",
 		`42`,
+		`[[{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}]]`,
+		`[{"type":"FeatureCollection","features":[]}]`,
 		`{"type":"FeatureCollection"}`,
 		`{"type":"FeatureCollection","bbox":"invalid","features":[]}`,
 		`{"type":"Point","coordinates":[1,2]}`,
@@ -152,6 +154,26 @@ func TestReadFeaturesRejectsInvalidTopLevelValues(t *testing.T) {
 				t.Fatalf("accepted invalid input %q", input)
 			}
 		})
+	}
+}
+
+func TestReadFeaturesRejectsNestedCollectionsBeforeVisitingTheirFeatures(t *testing.T) {
+	feature := `{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`
+	for _, input := range []string{
+		`[{"type":"FeatureCollection","features":[` + feature + `]}]`,
+		`[{"features":[` + feature + `],"type":"FeatureCollection"}]`,
+	} {
+		visited := 0
+		err := ReadFeatures(strings.NewReader(input), InputAuto, func(Feature) error {
+			visited++
+			return nil
+		})
+		if err == nil {
+			t.Fatalf("accepted nested FeatureCollection %s", input)
+		}
+		if visited != 0 {
+			t.Fatalf("visited %d nested Features before rejecting %s", visited, input)
+		}
 	}
 }
 

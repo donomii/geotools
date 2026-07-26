@@ -80,14 +80,17 @@ func ParseCRS(raw json.RawMessage) (string, error) {
 func NormalizeCRS(value string) (string, error) {
 	normalized := strings.TrimSpace(value)
 	upper := strings.ToUpper(normalized)
-	switch {
-	case upper == "OGC:CRS84", strings.HasSuffix(upper, "/OGC/0/CRS84"):
+	if definition, ok := crsDefinitionIdentifier(upper); ok {
+		upper = definition
+	}
+	switch upper {
+	case "OGC:CRS84":
 		return CRSCRS84, nil
-	case upper == "OGC:CRS84H", upper == "EPSG:4979", strings.HasSuffix(upper, "/OGC/0/CRS84H"), strings.HasSuffix(upper, "/EPSG/0/4979"):
+	case "OGC:CRS84H", "EPSG:4979":
 		return CRSCRS84h, nil
-	case upper == "EPSG:4326", strings.HasSuffix(upper, "/EPSG/0/4326"):
+	case "EPSG:4326":
 		return CRSEPSG4326, nil
-	case upper == "EPSG:3857", strings.HasSuffix(upper, "/EPSG/0/3857"):
+	case "EPSG:3857":
 		return CRSEPSG3857, nil
 	}
 	code, ok := epsgCode(upper)
@@ -101,11 +104,26 @@ func epsgCode(value string) (int, bool) {
 	codeText := ""
 	if strings.HasPrefix(value, "EPSG:") {
 		codeText = strings.TrimPrefix(value, "EPSG:")
-	} else if marker := strings.LastIndex(value, "/EPSG/0/"); marker >= 0 {
-		codeText = value[marker+len("/EPSG/0/"):]
 	}
 	code, err := strconv.Atoi(codeText)
 	return code, err == nil
+}
+
+func crsDefinitionIdentifier(value string) (string, bool) {
+	for _, prefix := range []string{"HTTP://WWW.OPENGIS.NET/DEF/CRS/", "HTTPS://WWW.OPENGIS.NET/DEF/CRS/"} {
+		if !strings.HasPrefix(value, prefix) {
+			continue
+		}
+		parts := strings.Split(strings.TrimPrefix(value, prefix), "/")
+		if len(parts) != 3 || parts[1] != "0" || parts[2] == "" {
+			return "", false
+		}
+		if parts[0] != "EPSG" && parts[0] != "OGC" {
+			return "", false
+		}
+		return parts[0] + ":" + parts[2], true
+	}
+	return "", false
 }
 
 func CRSURI(crs string) (string, error) {

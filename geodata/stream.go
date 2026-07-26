@@ -139,25 +139,28 @@ func readJSONValuesLimited(input io.Reader, maximumValues int, visit FeatureVisi
 			return fmt.Errorf("contains more than %d top-level JSON value", maximumValues)
 		}
 		valueNumber++
-		if err := visitJSONToken(decoder, token, visit); err != nil {
+		if err := visitJSONToken(decoder, token, visit, true, true); err != nil {
 			return fmt.Errorf("top-level GeoJSON value %d is invalid: %w", valueNumber, err)
 		}
 	}
 }
 
-func visitJSONToken(decoder *json.Decoder, token json.Token, visit FeatureVisitor) error {
+func visitJSONToken(decoder *json.Decoder, token json.Token, visit FeatureVisitor, allowArray, allowCollection bool) error {
 	delimiter, ok := token.(json.Delim)
 	if !ok {
 		return fmt.Errorf("expected a GeoJSON object or array, received %v", token)
 	}
 	switch delimiter {
 	case '[':
+		if !allowArray {
+			return fmt.Errorf("GeoJSON Feature arrays cannot contain nested arrays")
+		}
 		for decoder.More() {
 			elementToken, err := decoder.Token()
 			if err != nil {
 				return err
 			}
-			if err := visitJSONToken(decoder, elementToken, visit); err != nil {
+			if err := visitJSONToken(decoder, elementToken, visit, false, false); err != nil {
 				return err
 			}
 		}
@@ -170,13 +173,13 @@ func visitJSONToken(decoder *json.Decoder, token json.Token, visit FeatureVisito
 		}
 		return nil
 	case '{':
-		return visitJSONObject(decoder, visit)
+		return visitJSONObject(decoder, visit, allowCollection)
 	default:
 		return fmt.Errorf("unexpected JSON delimiter %q", delimiter)
 	}
 }
 
-func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor) error {
+func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor, allowCollection bool) error {
 	members := make(map[string]json.RawMessage)
 	seen := make(map[string]bool)
 	featuresSeen := false
@@ -196,6 +199,9 @@ func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor) error {
 		}
 		seen[key] = true
 		if key == "features" && rawObjectType(members["type"]) == "FeatureCollection" {
+			if !allowCollection {
+				return fmt.Errorf("GeoJSON Feature array contains a FeatureCollection")
+			}
 			featuresSeen = true
 			featuresStreamed = true
 			if err := visitFeatureArray(decoder, visit); err != nil {
@@ -233,6 +239,9 @@ func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor) error {
 		return fmt.Errorf("GeoJSON type must be a string: %w", err)
 	}
 	if objectType == "FeatureCollection" {
+		if !allowCollection {
+			return fmt.Errorf("GeoJSON Feature array contains a FeatureCollection")
+		}
 		if !featuresSeen {
 			return fmt.Errorf("FeatureCollection is missing features")
 		}

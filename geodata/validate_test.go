@@ -18,6 +18,7 @@ func TestValidateFeatureRejectsInvalidData(t *testing.T) {
 		"bbox dimension": `{"type":"Feature","bbox":[1,2,3,4,5,6],"geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`,
 		"bbox latitude":  `{"type":"Feature","bbox":[1,5,3,4],"geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`,
 		"bbox excludes":  `{"type":"Feature","bbox":[0,0,1,1],"geometry":{"type":"Point","coordinates":[2,2]},"properties":{}}`,
+		"wrapped bbox":   `{"type":"Feature","bbox":[170,-10,-170,10],"geometry":{"type":"Point","coordinates":[0,0]},"properties":{}}`,
 	}
 	for name, input := range cases {
 		t.Run(name, func(t *testing.T) {

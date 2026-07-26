@@ -131,6 +131,57 @@ func TestConvertEntiretyRejectsNonStringName(t *testing.T) {
 	}
 }
 
+func TestConvertEntiretyRejectsMalformedGeoJSON(t *testing.T) {
+	cases := []string{
+		``,
+		`{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]}}`,
+		`{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"geometry":{"type":"Point","coordinates":[3,4]},"properties":{}}`,
+		`{"type":"Feature","geometry":{"type":"Point","type":"Point","coordinates":[1,2]},"properties":{}}`,
+		`{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{"name":"first","name":"second"}}`,
+		`[[{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}]]`,
+		`[{"type":"FeatureCollection","features":[]}]`,
+	}
+	for _, input := range cases {
+		if err := forEachEntiretyFeature(strings.NewReader(input), func(feature entiretyFeature) error { return nil }); err == nil {
+			t.Fatalf("accepted malformed GeoJSON %q", input)
+		}
+	}
+}
+
+func TestEntiretyFeatureMayHaveForeignFeaturesMember(t *testing.T) {
+	input := `{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{},"features":[{"foreign":"metadata"}]}`
+	visited := 0
+	if err := forEachEntiretyFeature(strings.NewReader(input), func(feature entiretyFeature) error {
+		visited++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if visited != 1 {
+		t.Fatalf("visited %d Features; expected only the GeoJSON Feature", visited)
+	}
+}
+
+func TestEntiretyRejectsNestedCollectionsBeforeVisitingTheirFeatures(t *testing.T) {
+	feature := `{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`
+	for _, input := range []string{
+		`[{"type":"FeatureCollection","features":[` + feature + `]}]`,
+		`[{"features":[` + feature + `],"type":"FeatureCollection"}]`,
+	} {
+		visited := 0
+		err := forEachEntiretyFeature(strings.NewReader(input), func(feature entiretyFeature) error {
+			visited++
+			return nil
+		})
+		if err == nil {
+			t.Fatalf("accepted nested FeatureCollection %s", input)
+		}
+		if visited != 0 {
+			t.Fatalf("visited %d nested Features before rejecting %s", visited, input)
+		}
+	}
+}
+
 func TestEntiretyPointRejectsCoordinatesItCannotRepresent(t *testing.T) {
 	tests := []struct {
 		name        string

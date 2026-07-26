@@ -36,6 +36,8 @@ func TestParseCRSRejectsUnsupportedAndIncompleteReferences(t *testing.T) {
 		`{"type":"GeographicCRS","href":"http://www.opengis.net/def/crs/EPSG/0/4326"}`,
 		`{"type":"Reference"}`,
 		`{"id":{"authority":"EPSG","code":null}}`,
+		`"https://example.invalid/EPSG/0/3857"`,
+		`"https://www.opengis.net/def/crs/EPSG/0/3857/extra"`,
 	}
 	for _, input := range cases {
 		if _, err := ParseCRS(json.RawMessage(input)); err == nil {

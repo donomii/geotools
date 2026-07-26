@@ -196,6 +196,32 @@ func TestMVTEncodeRejectsShortOutputWrite(t *testing.T) {
 	}
 }
 
+func TestMVTEncodeReportsClippedFeatureCount(t *testing.T) {
+	settings := defaultMVTEncodeSettingsForTest()
+	settings.Zoom = 1
+	settings.X = 0
+	settings.Y = 0
+	cases := map[string]struct {
+		coordinates string
+		expected    int
+	}{
+		"inside":  {coordinates: `[-90,45]`, expected: 1},
+		"outside": {coordinates: `[90,-45]`, expected: 0},
+	}
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			input := strings.NewReader(`{"type":"Feature","geometry":{"type":"Point","coordinates":` + test.coordinates + `},"properties":{}}`)
+			count, err := EncodeMVTWithFeatureCount(input, &bytes.Buffer{}, InputAuto, settings)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count != test.expected {
+				t.Fatalf("encoded %d Features; expected %d", count, test.expected)
+			}
+		})
+	}
+}
+
 type shortMVTWriter struct{}
 
 func (shortMVTWriter) Write(data []byte) (int, error) {

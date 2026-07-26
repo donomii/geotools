@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 
@@ -16,6 +17,7 @@ type pbfFeatureCache interface {
 	LookupNodeByID(id int64) (map[string]string, error)
 	LookupNodes(way *osmpbf.Way) ([]map[string]string, error)
 	LookupWayNodes(wayID int64) ([]map[string]string, error)
+	LookupWayTags(wayID int64) (map[string]string, error)
 	Close() error
 }
 
@@ -25,14 +27,16 @@ type memoryNode struct {
 }
 
 type memoryFeatureCache struct {
-	nodes map[int64]memoryNode
-	ways  map[int64][]int64
+	nodes   map[int64]memoryNode
+	ways    map[int64][]int64
+	wayTags map[int64]map[string]string
 }
 
 func newMemoryFeatureCache() *memoryFeatureCache {
 	return &memoryFeatureCache{
-		nodes: make(map[int64]memoryNode),
-		ways:  make(map[int64][]int64),
+		nodes:   make(map[int64]memoryNode),
+		ways:    make(map[int64][]int64),
+		wayTags: make(map[int64]map[string]string),
 	}
 }
 
@@ -54,6 +58,7 @@ func (cache *memoryFeatureCache) PutNode(node *osmpbf.Node) error {
 
 func (cache *memoryFeatureCache) PutWay(way *osmpbf.Way) error {
 	cache.ways[way.ID] = append([]int64(nil), way.NodeIDs...)
+	cache.wayTags[way.ID] = copyPBFTags(way.Tags)
 	return nil
 }
 
@@ -85,6 +90,14 @@ func (cache *memoryFeatureCache) LookupWayNodes(wayID int64) ([]map[string]strin
 	return lookupPBFNodes(cache, &osmpbf.Way{ID: wayID, NodeIDs: nodeIDs})
 }
 
+func (cache *memoryFeatureCache) LookupWayTags(wayID int64) (map[string]string, error) {
+	tags, ok := cache.wayTags[wayID]
+	if !ok {
+		return nil, fmt.Errorf("way %d is not in the member cache", wayID)
+	}
+	return copyPBFTags(tags), nil
+}
+
 func (cache *memoryFeatureCache) Close() error {
 	return nil
 }
@@ -112,6 +125,11 @@ func (cache *levelDBFeatureCache) PutNode(node *osmpbf.Node) error {
 func (cache *levelDBFeatureCache) PutWay(way *osmpbf.Way) error {
 	id, value := wayToBytes(way)
 	cache.batch.Put([]byte(id), value)
+	tags, err := json.Marshal(way.Tags)
+	if err != nil {
+		return fmt.Errorf("failed to encode way %d tags for the LevelDB member cache: %w", way.ID, err)
+	}
+	cache.batch.Put([]byte("T"+strconv.FormatInt(way.ID, 10)), tags)
 	return cache.flushFullBatch()
 }
 
@@ -164,6 +182,19 @@ func (cache *levelDBFeatureCache) LookupWayNodes(wayID int64) ([]map[string]stri
 	return lookupPBFNodes(cache, &osmpbf.Way{ID: wayID, NodeIDs: nodeIDs})
 }
 
+func (cache *levelDBFeatureCache) LookupWayTags(wayID int64) (map[string]string, error) {
+	key := "T" + strconv.FormatInt(wayID, 10)
+	data, err := cache.database.Get([]byte(key), nil)
+	if err != nil {
+		return nil, fmt.Errorf("way %d tags are not in the LevelDB member cache: %w", wayID, err)
+	}
+	var tags map[string]string
+	if err := json.Unmarshal(data, &tags); err != nil {
+		return nil, fmt.Errorf("way %d has invalid LevelDB member tag data: %w", wayID, err)
+	}
+	return tags, nil
+}
+
 func (cache *levelDBFeatureCache) Close() error {
 	if err := cache.Flush(); err != nil {
 		closeErr := cache.database.Close()
@@ -188,4 +219,12 @@ func lookupPBFNodes(cache pbfFeatureCache, way *osmpbf.Way) ([]map[string]string
 		nodes = append(nodes, node)
 	}
 	return nodes, nil
+}
+
+func copyPBFTags(tags map[string]string) map[string]string {
+	copied := make(map[string]string, len(tags))
+	for key, value := range tags {
+		copied[key] = value
+	}
+	return copied
 }

@@ -141,6 +141,25 @@ func TestPBFClosedWayGeometryUsesAreaTags(t *testing.T) {
 	}
 }
 
+func TestPBFNestedRelationResolvesAreaWay(t *testing.T) {
+	for _, diskCache := range []bool{false, true} {
+		t.Run(map[bool]string{false: "memory", true: "disk"}[diskCache], func(t *testing.T) {
+			output := convertPBFDataForTest(t, nestedRelationPBF(t), "selected~yes", false, false, diskCache)
+			features := decodePBFJSONL(t, output)
+			if len(features) != 1 {
+				t.Fatalf("converted %d Features; expected the selected parent relation", len(features))
+			}
+			relation := pbfFeatureByID(t, features, "relation/400")
+			if relation.Geometry.Type != "GeometryCollection" || len(relation.Geometry.Geometries) != 1 {
+				t.Fatalf("nested relation geometry is %#v", relation.Geometry)
+			}
+			if relation.Geometry.Geometries[0].Type != "Polygon" {
+				t.Fatalf("nested building way became %s; expected Polygon", relation.Geometry.Geometries[0].Type)
+			}
+		})
+	}
+}
+
 func TestPBFDecoderReportsTruncatedData(t *testing.T) {
 	data := realVancouverPBF(t)
 	err := validatePBFFraming(bytes.NewReader(data[:len(data)-7]))
@@ -181,7 +200,7 @@ func TestPBFMemoryAndDiskCachesResolveWays(t *testing.T) {
 			}
 			first := &osmpbf.Node{ID: 10, Lat: 1.25, Lon: 103.5}
 			second := &osmpbf.Node{ID: 11, Lat: 1.5, Lon: 104.0}
-			way := &osmpbf.Way{ID: 20, NodeIDs: []int64{10, 11}}
+			way := &osmpbf.Way{ID: 20, NodeIDs: []int64{10, 11}, Tags: map[string]string{"building": "yes"}}
 			if err := cache.PutNode(first); err != nil {
 				t.Fatal(err)
 			}
@@ -201,6 +220,13 @@ func TestPBFMemoryAndDiskCachesResolveWays(t *testing.T) {
 			if len(nodes) != 2 || nodes[0]["lat"] != "1.2500000" || nodes[1]["lon"] != "104.0000000" {
 				t.Fatalf("resolved way nodes are %#v", nodes)
 			}
+			tags, err := cache.LookupWayTags(way.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tags["building"] != "yes" {
+				t.Fatalf("resolved way tags are %#v", tags)
+			}
 			if err := cache.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -210,8 +236,13 @@ func TestPBFMemoryAndDiskCachesResolveWays(t *testing.T) {
 
 func convertPBFForTest(t *testing.T, tagExpression string, strictOutput, includeWayNodes bool) string {
 	t.Helper()
+	return convertPBFDataForTest(t, realVancouverPBF(t), tagExpression, strictOutput, includeWayNodes, false)
+}
+
+func convertPBFDataForTest(t *testing.T, data []byte, tagExpression string, strictOutput, includeWayNodes, diskCache bool) string {
+	t.Helper()
 	filename := filepath.Join(t.TempDir(), "vancouver.osm.pbf")
-	if err := os.WriteFile(filename, realVancouverPBF(t), 0600); err != nil {
+	if err := os.WriteFile(filename, data, 0600); err != nil {
 		t.Fatal(err)
 	}
 	file, err := os.Open(filename)
@@ -226,6 +257,9 @@ func convertPBFForTest(t *testing.T, tagExpression string, strictOutput, include
 		WayNodes:  includeWayNodes,
 		Strict:    strictOutput,
 	}
+	if diskCache {
+		config.LevedbPath = filepath.Join(t.TempDir(), "leveldb")
+	}
 	masks := NewBitmaskMap()
 	decoder := startTestPBFDecoder(t, file)
 	if err := index(decoder, masks, config); err != nil {
@@ -234,17 +268,21 @@ func convertPBFForTest(t *testing.T, tagExpression string, strictOutput, include
 	if !masks.RelWays.Empty() || !masks.RelRelation.Empty() {
 		for {
 			relationCount := masks.RelRelation.Len()
+			wayCount := masks.RelWays.Len()
 			seekTestPBF(t, file)
 			relationDecoder := startTestPBFDecoder(t, file)
 			if err := indexRelationMembers(relationDecoder, masks, config); err != nil {
 				t.Fatal(err)
 			}
-			if masks.RelRelation.Len() == relationCount {
+			if masks.RelRelation.Len() == relationCount && masks.RelWays.Len() == wayCount {
 				break
 			}
 		}
 	}
-	cache := newMemoryFeatureCache()
+	cache, err := openPBFFeatureCache(config.LevedbPath, config.BatchSize)
+	if err != nil {
+		t.Fatal(err)
+	}
 	seekTestPBF(t, file)
 	outputDecoder := startTestPBFDecoder(t, file)
 	var output bytes.Buffer
@@ -416,6 +454,51 @@ func realVancouverPBF(t *testing.T) []byte {
 		Writingprogram:   proto.String("geotools test encoder"),
 		Source:           proto.String("OpenStreetMap Vancouver extract records"),
 	}
+	var output bytes.Buffer
+	if err := appendPBFBlock(&output, "OSMHeader", header); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendPBFBlock(&output, "OSMData", block); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
+}
+
+func nestedRelationPBF(t *testing.T) []byte {
+	t.Helper()
+	table := newTestPBFStringTable()
+	nodes := []*OSMPBF.Node{
+		{Id: proto.Int64(100), Lat: proto.Int64(0), Lon: proto.Int64(0)},
+		{Id: proto.Int64(101), Lat: proto.Int64(0), Lon: proto.Int64(1e7)},
+		{Id: proto.Int64(102), Lat: proto.Int64(1e7), Lon: proto.Int64(1e7)},
+		{Id: proto.Int64(103), Lat: proto.Int64(1e7), Lon: proto.Int64(0)},
+	}
+	wayKeys, wayValues := table.tags("building", "yes")
+	way := &OSMPBF.Way{
+		Id: proto.Int64(200), Keys: wayKeys, Vals: wayValues,
+		Refs: deltaEncodeIDs([]int64{100, 101, 102, 103, 100}),
+	}
+	childKeys, childValues := table.tags("type", "site")
+	child := &OSMPBF.Relation{
+		Id: proto.Int64(300), Keys: childKeys, Vals: childValues,
+		RolesSid: []int32{int32(table.index(""))}, Memids: []int64{200},
+		Types: []OSMPBF.Relation_MemberType{OSMPBF.Relation_WAY},
+	}
+	parentKeys, parentValues := table.tags("type", "collection", "selected", "yes")
+	parent := &OSMPBF.Relation{
+		Id: proto.Int64(400), Keys: parentKeys, Vals: parentValues,
+		RolesSid: []int32{int32(table.index(""))}, Memids: []int64{300},
+		Types: []OSMPBF.Relation_MemberType{OSMPBF.Relation_RELATION},
+	}
+	block := &OSMPBF.PrimitiveBlock{
+		Stringtable: &OSMPBF.StringTable{S: table.values},
+		Primitivegroup: []*OSMPBF.PrimitiveGroup{
+			{Nodes: nodes},
+			{Ways: []*OSMPBF.Way{way}},
+			{Relations: []*OSMPBF.Relation{child, parent}},
+		},
+	}
+	header := &OSMPBF.HeaderBlock{RequiredFeatures: []string{"OsmSchema-V0.6"}}
 	var output bytes.Buffer
 	if err := appendPBFBlock(&output, "OSMHeader", header); err != nil {
 		t.Fatal(err)

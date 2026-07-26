@@ -11,6 +11,9 @@ import (
 type ValidationOptions struct {
 	AllowNullGeometry bool
 	AllowOutOfRange   bool
+	wrappedLongitude  bool
+	westLongitude     float64
+	eastLongitude     float64
 }
 
 type GeometrySummary struct {
@@ -58,6 +61,11 @@ func ValidateFeature(feature Feature, options ValidationOptions) (GeometrySummar
 			return GeometrySummary{Type: "null"}, nil
 		}
 		return GeometrySummary{}, fmt.Errorf("Feature %s has null geometry; enable null geometry only when the consumer supports it", feature.EncodedID())
+	}
+	if bboxDimension != 0 && bboxValues[0] > bboxValues[bboxDimension] {
+		options.wrappedLongitude = true
+		options.westLongitude = bboxValues[0]
+		options.eastLongitude = bboxValues[bboxDimension]
 	}
 	summary, err := inspectGeometry(feature.Geometry, options, "geometry")
 	if err != nil {
@@ -269,6 +277,9 @@ func decodePosition(raw json.RawMessage, path string, options ValidationOptions)
 		if position[1] < -90 || position[1] > 90 {
 			return nil, fmt.Errorf("%s latitude is %v; expected -90 through 90", path, position[1])
 		}
+	}
+	if options.wrappedLongitude && position[0] < options.westLongitude && position[0] > options.eastLongitude {
+		return nil, fmt.Errorf("%s longitude is %v; wrapped bbox contains %v through 180 or -180 through %v", path, position[0], options.westLongitude, options.eastLongitude)
 	}
 	return position, nil
 }

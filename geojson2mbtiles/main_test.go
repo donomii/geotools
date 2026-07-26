@@ -93,6 +93,60 @@ func TestMBTilesTileLimit(t *testing.T) {
 	}
 }
 
+func TestMBTilesTileLimitCountsOnlyNonEmptyTiles(t *testing.T) {
+	input := bytes.NewBufferString(`{"type":"Feature","geometry":{"type":"LineString","coordinates":[[-170,-80],[170,80]]},"properties":{}}`)
+	settings := archiveSettings{
+		InputMode: geodata.InputAuto, Name: "sparse", Layer: "features", MinZoom: 3, MaxZoom: 3,
+		Extent: 4096, Buffer: 64, Simplify: 1, Gzip: true, MaxTiles: 30,
+	}
+	database, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := writeMBTilesDatabase(database, input, settings); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := database.Query(`SELECT zoom_level, tile_column, tile_row, tile_data FROM tiles`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tileCount := 0
+	for rows.Next() {
+		tileCount++
+		var zoom, column, tmsRow uint
+		var tileData []byte
+		if err := rows.Scan(&zoom, &column, &tmsRow, &tileData); err != nil {
+			t.Fatal(err)
+		}
+		xyzRow := (uint(1) << zoom) - 1 - tmsRow
+		var decoded bytes.Buffer
+		decodeSettings := geodata.MVTDecodeSettings{Zoom: zoom, X: column, Y: xyzRow, Layer: "features", Gzip: true}
+		if err := geodata.DecodeMVT(bytes.NewReader(tileData), &decoded, geodata.OutputCollection, decodeSettings); err != nil {
+			t.Fatal(err)
+		}
+		featureCount := 0
+		if err := geodata.ReadFeatures(&decoded, geodata.InputAuto, func(geodata.Feature) error {
+			featureCount++
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if featureCount == 0 {
+			t.Fatalf("stored empty tile %d/%d/%d", zoom, column, xyzRow)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if tileCount == 0 || tileCount > settings.MaxTiles {
+		t.Fatalf("archive contains %d non-empty tiles; expected 1 through %d", tileCount, settings.MaxTiles)
+	}
+}
+
 func TestMBTilesRejectsConflictingReservedPropertiesBeforeWriting(t *testing.T) {
 	input := bytes.NewBufferString(`{"type":"Feature","geometry":{"type":"Point","coordinates":[0,0]},"properties":{"routing":"places"}}`)
 	settings := archiveSettings{
