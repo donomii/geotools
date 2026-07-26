@@ -953,9 +953,33 @@ func normalizeJSONFGTime(raw json.RawMessage) (json.RawMessage, error) {
 }
 
 func validateJSONFGTime(raw json.RawMessage) error {
-	var value jsonFGTimeValue
-	if err := json.Unmarshal(raw, &value); err != nil {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
 		return fmt.Errorf("time must be an object: %w", err)
+	}
+	if members == nil {
+		return fmt.Errorf("time must be an object, received null")
+	}
+	for name := range members {
+		if name != "date" && name != "timestamp" && name != "interval" {
+			return fmt.Errorf("time contains unknown member %q", name)
+		}
+	}
+	var value jsonFGTimeValue
+	if rawDate, exists := members["date"]; exists {
+		if err := json.Unmarshal(rawDate, &value.Date); err != nil || value.Date == "" {
+			return fmt.Errorf("time date %s is not a non-empty string", rawDate)
+		}
+	}
+	if rawTimestamp, exists := members["timestamp"]; exists {
+		if err := json.Unmarshal(rawTimestamp, &value.Timestamp); err != nil || value.Timestamp == "" {
+			return fmt.Errorf("time timestamp %s is not a non-empty string", rawTimestamp)
+		}
+	}
+	if rawInterval, exists := members["interval"]; exists {
+		if err := json.Unmarshal(rawInterval, &value.Interval); err != nil || value.Interval == nil {
+			return fmt.Errorf("time interval %s is not an array", rawInterval)
+		}
 	}
 	if value.Date == "" && value.Timestamp == "" && value.Interval == nil {
 		return fmt.Errorf("time has no date, timestamp, or interval")

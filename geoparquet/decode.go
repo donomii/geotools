@@ -40,21 +40,49 @@ func decodeGeoParquetGeometry(values [][]parquet.Value, paths [][]string, primar
 		if len(path) > 1 && path[0] == primaryColumn {
 			name := path[len(path)-1]
 			if name == "x" || name == "y" || name == "z" {
-				axes[name] = nonNullParquetValues(values[index])
+				axes[name] = values[index]
 			}
 		}
 	}
-	if len(axes["x"]) == 0 && len(axes["y"]) == 0 {
-		return nil, nil
+	if _, exists := axes["x"]; !exists {
+		return nil, fmt.Errorf("native %s geometry column %q has no x axis", encoding, primaryColumn)
 	}
-	if len(axes["x"]) == 0 || len(axes["x"]) != len(axes["y"]) {
-		return nil, fmt.Errorf("native %s geometry has %d x values and %d y values", encoding, len(axes["x"]), len(axes["y"]))
+	if _, exists := axes["y"]; !exists {
+		return nil, fmt.Errorf("native %s geometry column %q has no y axis", encoding, primaryColumn)
+	}
+	axisNames := []string{"x", "y"}
+	if _, exists := axes["z"]; exists {
+		axisNames = append(axisNames, "z")
+	}
+	for _, name := range axisNames[1:] {
+		if len(axes[name]) != len(axes["x"]) {
+			return nil, fmt.Errorf("native %s geometry has %d x value slots and %d %s value slots", encoding, len(axes["x"]), len(axes[name]), name)
+		}
+	}
+	nonNullAxes := make(map[string][]parquet.Value, len(axisNames))
+	for index := range axes["x"] {
+		x := axes["x"][index]
+		for _, name := range axisNames[1:] {
+			value := axes[name][index]
+			if value.IsNull() != x.IsNull() {
+				return nil, fmt.Errorf("native %s geometry coordinate slot %d has a null %s value but a non-null %s value", encoding, index, nullAxisName(x, "x", name), nonNullAxisName(x, "x", name))
+			}
+			if value.RepetitionLevel() != x.RepetitionLevel() || value.DefinitionLevel() != x.DefinitionLevel() {
+				return nil, fmt.Errorf("native %s geometry coordinate slot %d has mismatched x and %s repetition or definition levels", encoding, index, name)
+			}
+		}
+		if !x.IsNull() {
+			for _, name := range axisNames {
+				nonNullAxes[name] = append(nonNullAxes[name], axes[name][index])
+			}
+		}
+	}
+	axes = nonNullAxes
+	if len(axes["x"]) == 0 {
+		return nil, nil
 	}
 	dimension := 2
 	if len(axes["z"]) > 0 {
-		if len(axes["z"]) != len(axes["x"]) {
-			return nil, fmt.Errorf("native %s geometry has %d x values and %d z values", encoding, len(axes["x"]), len(axes["z"]))
-		}
 		dimension = 3
 	}
 	layout := geom.XY
@@ -83,6 +111,20 @@ func decodeGeoParquetGeometry(values [][]parquet.Value, paths [][]string, primar
 		repetitions[index] = axes["x"][index].RepetitionLevel()
 	}
 	return buildNativeGeoParquetGeometry(encoding, layout, flat, repetitions)
+}
+
+func nullAxisName(x parquet.Value, xName, otherName string) string {
+	if x.IsNull() {
+		return xName
+	}
+	return otherName
+}
+
+func nonNullAxisName(x parquet.Value, xName, otherName string) string {
+	if x.IsNull() {
+		return otherName
+	}
+	return xName
 }
 
 func nonNullParquetValues(values []parquet.Value) []parquet.Value {

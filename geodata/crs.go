@@ -273,6 +273,10 @@ func projectedCoordinateToWGS84(x, y float64, crs string) (float64, float64, err
 	}
 	switch crs {
 	case CRSEPSG3857:
+		const webMercatorLimit = 20037508.342789244
+		if x < -webMercatorLimit || x > webMercatorLimit || y < -webMercatorLimit || y > webMercatorLimit {
+			return 0, 0, fmt.Errorf("Web Mercator coordinate [%v,%v] is outside %v through %v", x, y, -webMercatorLimit, webMercatorLimit)
+		}
 		return x * 180 / (math.Pi * 6378137), (2*math.Atan(math.Exp(y/6378137)) - math.Pi/2) * 180 / math.Pi, nil
 	case CRSEPSG3395:
 		return inverseWorldMercator(x, y)
@@ -292,12 +296,17 @@ func wgs84ToProjectedCoordinate(longitude, latitude float64, crs string) (float6
 	if latitude < -90 || latitude > 90 {
 		return 0, 0, fmt.Errorf("latitude %v is outside -90 through 90", latitude)
 	}
+	if longitude < -180 || longitude > 180 {
+		return 0, 0, fmt.Errorf("longitude %v is outside -180 through 180", longitude)
+	}
 	if crs == CRSCRS84 || crs == CRSCRS84h || crs == CRSEPSG4326 {
 		return longitude, latitude, nil
 	}
 	switch crs {
 	case CRSEPSG3857:
-		latitude = math.Max(-85.0511287798066, math.Min(85.0511287798066, latitude))
+		if latitude < -85.0511287798066 || latitude > 85.0511287798066 {
+			return 0, 0, fmt.Errorf("Web Mercator latitude %v is outside -85.0511287798066 through 85.0511287798066", latitude)
+		}
 		return longitude * math.Pi * 6378137 / 180, math.Log(math.Tan((90+latitude)*math.Pi/360)) * 6378137, nil
 	case CRSEPSG3395:
 		return worldMercator(longitude, latitude)

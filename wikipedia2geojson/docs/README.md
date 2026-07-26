@@ -1,88 +1,39 @@
-# Extract geojson coordinates from wikipedia files
+# wikipedia2geojson
 
-Wikipedia2geojson reads wikipedia files and prints out locations (geolocation data) . 
+`wikipedia2geojson` extracts coordinate-bearing pages from local Wikipedia XML dumps as GeoJSON Points. It reads plain XML, gzip, bzip2, standard input, and Wikipedia multistream index/data pairs without making network requests.
 
-It can read compressed files, and compressed streams.  Works on Linux, MacOS, and MS Windows.
+Build all commands from the repository root:
 
-# Example
+```sh
+./build_all.sh
+```
 
-        wikipedia2geojson.exe file.xml.bz2
+Process a compressed dump as GeoJSON Lines:
 
-Reads from file.xml.bz2, automatically uncompressing bz2 format
+```sh
+./bin/wikipedia2geojson enwiki-pages.xml.bz2 > places.geojsonl
+```
 
-    [
-    { "type": "Feature", "geometry": { "type": "Point", "coordinates": [ 2, 28 ] }, "properties": { "name": ""Algeria"" } }
-    { "type": "Feature", "geometry": { "type": "Point", "coordinates": [ 30, 42 ] }, "properties": { "name": ""Andorra"" } }
-    { "type": "Feature", "geometry": { "type": "Point", "coordinates": [ -150, 64 ] }, "properties": { "name": ""Alaska"" } }
-    { "type": "Feature", "geometry": { "type": "Point", "coordinates": [ 19, 13 ] }, "properties": { "name": ""Apollo 11"" } }
-    
-Each location is on its own line, so you can pipe this stream into grep and other command line programs.  
+Write one GeoJSON FeatureCollection:
 
-# Streaming
+```sh
+./bin/wikipedia2geojson -strict enwiki-pages.xml.gz > places.geojson
+```
 
-Because w2j can read compressed streams, you can process network files on the fly.  You don't need to download them completely first.
+Read compressed standard input:
 
-    wget -q -O - http://someserver.com/enwiki-pages-articles2.xml.bz2 | wikipedia2geojson --compression=bz2 -
+```sh
+./bin/wikipedia2geojson -compression=bz2 - < enwiki-pages.xml.bz2 > places.geojsonl
+```
 
-# Installation
+Read a multistream index and data file:
 
-        go get -u github.com/donomii/wikipedia2geojson
-      
-# More examples
+```sh
+./bin/wikipedia2geojson enwiki-index.txt.bz2 enwiki-pages-multistream.xml.bz2 > places.geojsonl
+```
 
+Useful options are `-compression`, `-cpus=N`, `-workers=8`, `-strict`, `-help`, and `-test`. An empty compression setting detects the format from the filename; use `gz` or `bz2` for compressed standard input. Worker counts may range from 1 through 1000.
 
-        wikipedia2geojson.exe file.xml
+The converter examines only the first revision present for each page and preserves source-page order with bounded queues. Pages without coordinates are skipped. Pages without revisions or with invalid or non-finite coordinates are written to standard error and `errors.gob`. XML parser failures abort conversion and are not added to that file.
 
-                Read from file.xml
-
-
-        wikipedia2geojson.exe file.xml.bz2
-
-                Read from file.xml.bz2, automatically uncompressing bz2 format
-
-
-        wikipedia2geojson.exe file.xml.gz
-
-                Read from file.xml.bz2, automatically uncompressing gz format
-
-
-        wikipedia2geojson.exe --compression=bz2 file
-
-                Read from file, force uncompressing bz2 format
-
-
-        wikipedia2geojson.exe --compression=gz file
-
-                Read from file, force uncompressing gz format
-
-
-        wikipedia2geojson.exe -
-
-                Read from stdin.
-
-
-        wikipedia2geojson.exe --compression=bz2 -
-
-                Read from stdin.  Stdin is in bzip2 format
-
-
-        wikipedia2geojson.exe --compression=gz -
-
-                Read from stdin.  Stdin is in gz format
-
-# Known bugs
-
-You can't stream straight from the network on MS Windows, because Windows fiddles with the data as it goes through the pipe, and most download programs don't know how to stop that.
-
-So this won't work
-
-    wget -q -O - http://someserver.com/enwiki-pages-articles2.xml.bz2 | wikipedia2geojson.exe --compression=bz2 -
-
-# Bonus
-
-A perl one liner to unpack the wikipedia geodata files in sql format
-
-    type enwiki-20171103-geo_tags.sql | perl -pe "s/\),\(/\r\n/g" | perl -ne "@c=split/,/;if($c[8]ne'NULL'){print '{ \"type\": \"Feature\", \"geometry\": { \"type\": \"Point\", \"coordinates\": [ '.$c[4].', '.$c[5].' ] }, \"properties\": { \"name\": '.$c[8].' } };'.\"\n\";}"
-    
-Wikipedia's geodata extraction appears to have trouble identifying points, so wikipedia2geojson will be useful for a bit longer yet.
-
+The complete guide is in the parent [`README.md`](../README.md).

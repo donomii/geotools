@@ -4,6 +4,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/bzip2"
+	"compress/gzip"
 	"encoding/gob"
 	"encoding/json"
 	"errors"
@@ -11,12 +13,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
-
-	"github.com/donomii/goof"
 
 	"github.com/dustin/go-humanize"
 	"github.com/dustin/go-wikiparse"
@@ -25,6 +27,8 @@ import (
 var compression string
 var numWorkers int
 var strict bool
+
+const wikiResultWindow = 1000
 
 type wikiGeometry struct {
 	Type        string    `json:"type"`
@@ -60,6 +64,9 @@ func parsePageCoords(page *wikiparse.Page) (*wikiFeature, bool, error) {
 		return nil, false, nil
 	} else if err != nil {
 		return nil, false, fmt.Errorf("page %q (%d) has invalid coordinates: %w", page.Title, page.ID, err)
+	}
+	if math.IsNaN(location.Lon) || math.IsInf(location.Lon, 0) || math.IsNaN(location.Lat) || math.IsInf(location.Lat, 0) {
+		return nil, false, fmt.Errorf("page %q (%d) has non-finite coordinates [%v, %v]", page.Title, page.ID, location.Lon, location.Lat)
 	}
 	return &wikiFeature{
 		Type:       "Feature",
@@ -114,9 +121,11 @@ func errorHandler(pages <-chan *wikiparse.Page) error {
 
 func process(parser wikiparse.Parser, output io.Writer) error {
 	log.Printf("Got site info:  %+v", parser.SiteInfo())
-	tasks := make(chan wikiPageTask, 1000)
-	results := make(chan wikiPageResult, 1000)
+	queueSize := numWorkers * 2
+	tasks := make(chan wikiPageTask, queueSize)
+	results := make(chan wikiPageResult, queueSize)
 	errorPages := make(chan *wikiparse.Page, 10)
+	resultSlots := make(chan struct{}, wikiResultWindow)
 	var workerGroup sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
 		workerGroup.Add(1)
@@ -124,7 +133,7 @@ func process(parser wikiparse.Parser, output io.Writer) error {
 	}
 	writerDone := make(chan error, 1)
 	go func() {
-		writerDone <- writeWikiResults(results, output, strict)
+		writerDone <- writeWikiResultsWithSlots(results, output, strict, resultSlots)
 	}()
 	errorDone := make(chan error, 1)
 	go func() {
@@ -142,6 +151,7 @@ func process(parser wikiparse.Parser, output io.Writer) error {
 			parserErr = err
 			break
 		}
+		resultSlots <- struct{}{}
 		tasks <- wikiPageTask{Sequence: pages, Page: page}
 
 		pages++
@@ -174,6 +184,10 @@ func process(parser wikiparse.Parser, output io.Writer) error {
 }
 
 func writeWikiResults(results <-chan wikiPageResult, output io.Writer, strictOutput bool) error {
+	return writeWikiResultsWithSlots(results, output, strictOutput, nil)
+}
+
+func writeWikiResultsWithSlots(results <-chan wikiPageResult, output io.Writer, strictOutput bool, resultSlots chan struct{}) error {
 	writer := bufio.NewWriter(output)
 	var firstErr error
 	if strictOutput {
@@ -216,6 +230,9 @@ func writeWikiResults(results <-chan wikiPageResult, output io.Writer, strictOut
 				}
 			}
 			nextSequence++
+			if resultSlots != nil {
+				<-resultSlots
+			}
 		}
 	}
 	if len(pending) != 0 {
@@ -229,12 +246,76 @@ func writeWikiResults(results <-chan wikiPageResult, output io.Writer, strictOut
 	return errors.Join(firstErr, writer.Flush())
 }
 
-func processSingleStream(filename string) error {
-	p, err := wikiparse.NewParser(goof.OpenInput(filename, compression))
-	if err != nil {
-		return fmt.Errorf("failed to set up Wikipedia parser for %q: %w", filename, err)
+type wikipediaInput struct {
+	io.Reader
+	file       *os.File
+	compressor *gzip.Reader
+	closeFile  bool
+}
+
+func openWikipediaInput(filename, configuredCompression string) (*wikipediaInput, error) {
+	selectedCompression := strings.ToLower(strings.TrimSpace(configuredCompression))
+	if selectedCompression == "" {
+		lowerName := strings.ToLower(filename)
+		if strings.HasSuffix(lowerName, ".gz") {
+			selectedCompression = "gz"
+		} else if strings.HasSuffix(lowerName, ".bz2") {
+			selectedCompression = "bz2"
+		}
 	}
-	return process(p, os.Stdout)
+	if selectedCompression != "" && selectedCompression != "gz" && selectedCompression != "bz2" {
+		return nil, fmt.Errorf("Wikipedia input compression %q is unsupported; expected gz, bz2, or empty for filename detection", configuredCompression)
+	}
+	file := os.Stdin
+	closeFile := false
+	var err error
+	if filename != "" {
+		file, err = os.Open(filename)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open Wikipedia input %q: %w", filename, err)
+		}
+		closeFile = true
+	}
+	buffered := bufio.NewReaderSize(file, 64*1024)
+	input := &wikipediaInput{Reader: buffered, file: file, closeFile: closeFile}
+	if selectedCompression == "gz" {
+		input.compressor, err = gzip.NewReader(buffered)
+		if err != nil {
+			openErr := fmt.Errorf("failed to open gzip-compressed Wikipedia input %q: %w", filename, err)
+			if closeFile {
+				return nil, errors.Join(openErr, file.Close())
+			}
+			return nil, openErr
+		}
+		input.Reader = input.compressor
+	} else if selectedCompression == "bz2" {
+		input.Reader = bzip2.NewReader(buffered)
+	}
+	return input, nil
+}
+
+func (input *wikipediaInput) Close() error {
+	var compressorErr error
+	if input.compressor != nil {
+		compressorErr = input.compressor.Close()
+	}
+	var fileErr error
+	if input.closeFile {
+		fileErr = input.file.Close()
+	}
+	return errors.Join(compressorErr, fileErr)
+}
+
+func processSingleStream(filename string) error {
+	input, err := openWikipediaInput(filename, compression)
+	if err != nil {
+		return err
+	}
+	p, err := wikiparse.NewParser(input)
+	if err != nil {
+		return errors.Join(fmt.Errorf("failed to set up Wikipedia parser for %q: %w", filename, err), input.Close())
+	}
+	return errors.Join(process(p, os.Stdout), input.Close())
 }
 
 func processMultiStream(idx, data string) error {
@@ -260,8 +341,8 @@ Use:
 
 		
 	wikipedia2geojson.exe file.xml.gz
-	
-		Read from file.xml.bz2, automatically uncompressing gz format
+
+		Read from file.xml.gz, automatically uncompressing gz format
 
 		
 	wikipedia2geojson.exe --compression=bz2 file
@@ -345,6 +426,9 @@ func main() {
 	}
 	if numWorkers < 1 {
 		log.Fatal("invalid workers: expected an integer greater than zero")
+	}
+	if numWorkers > wikiResultWindow {
+		log.Fatalf("invalid workers: received %d, maximum is %d", numWorkers, wikiResultWindow)
 	}
 	if cpus < 1 {
 		log.Fatal("invalid cpus: expected an integer greater than zero")

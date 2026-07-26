@@ -17,6 +17,7 @@ func TestValidateFeatureRejectsInvalidData(t *testing.T) {
 		"bad properties": `{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":[]}`,
 		"bbox dimension": `{"type":"Feature","bbox":[1,2,3,4,5,6],"geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`,
 		"bbox latitude":  `{"type":"Feature","bbox":[1,5,3,4],"geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`,
+		"bbox excludes":  `{"type":"Feature","bbox":[0,0,1,1],"geometry":{"type":"Point","coordinates":[2,2]},"properties":{}}`,
 	}
 	for name, input := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -55,6 +56,16 @@ func TestValidateFeatureOptions(t *testing.T) {
 	}
 }
 
+func TestValidateFeatureAcceptsArbitrarilyLargeNumericID(t *testing.T) {
+	var feature Feature
+	if err := json.Unmarshal([]byte(`{"type":"Feature","id":1e400,"geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`), &feature); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateFeature(feature, ValidationOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestValidateCoordinateDimensions(t *testing.T) {
 	var threeDimensional Feature
 	if err := json.Unmarshal([]byte(`{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2,3]},"properties":{}}`), &threeDimensional); err != nil {
@@ -73,6 +84,21 @@ func TestValidateCoordinateDimensions(t *testing.T) {
 	}
 	if _, err := ValidateFeature(mixed, ValidationOptions{}); err == nil {
 		t.Fatal("accepted geometry with mixed coordinate dimensions")
+	}
+}
+
+func TestValidateHigherDimensionalAndAntimeridianBBoxes(t *testing.T) {
+	for _, input := range []string{
+		`{"type":"Feature","bbox":[1,2,3,4,1,2,3,4],"geometry":{"type":"Point","coordinates":[1,2,3,4]},"properties":{}}`,
+		`{"type":"Feature","bbox":[177,-20,-178,-16],"geometry":{"type":"LineString","coordinates":[[179,-18],[-179,-17]]},"properties":{}}`,
+	} {
+		var feature Feature
+		if err := json.Unmarshal([]byte(input), &feature); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ValidateFeature(feature, ValidationOptions{}); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

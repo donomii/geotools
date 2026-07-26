@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 )
 
@@ -19,6 +20,8 @@ type GeometrySummary struct {
 	PositionCount       int64
 	CoordinateDimension int
 	mixedDimensions     bool
+	minimums            []float64
+	maximums            []float64
 }
 
 type geometryObject struct {
@@ -43,7 +46,7 @@ func ValidateFeature(feature Feature, options ValidationOptions) (GeometrySummar
 			return GeometrySummary{}, fmt.Errorf("Feature %s properties must be an object or null: %w", feature.EncodedID(), err)
 		}
 	}
-	bboxDimension, err := validateBBox(feature.BBox)
+	bboxDimension, bboxValues, err := validateBBox(feature.BBox)
 	if err != nil {
 		return GeometrySummary{}, fmt.Errorf("Feature %s bbox is invalid: %w", feature.EncodedID(), err)
 	}
@@ -66,6 +69,16 @@ func ValidateFeature(feature Feature, options ValidationOptions) (GeometrySummar
 	if bboxDimension != 0 && bboxDimension != summary.CoordinateDimension {
 		return GeometrySummary{}, fmt.Errorf("Feature %s bbox describes %d dimensions but geometry positions contain %d coordinates", feature.EncodedID(), bboxDimension, summary.CoordinateDimension)
 	}
+	for dimension := 0; dimension < bboxDimension; dimension++ {
+		if dimension == 0 && bboxValues[0] > bboxValues[bboxDimension] {
+			continue
+		}
+		if bboxValues[dimension] > summary.minimums[dimension] || bboxValues[bboxDimension+dimension] < summary.maximums[dimension] {
+			return GeometrySummary{}, fmt.Errorf("Feature %s bbox range %v..%v for dimension %d does not contain geometry range %v..%v",
+				feature.EncodedID(), bboxValues[dimension], bboxValues[bboxDimension+dimension], dimension+1,
+				summary.minimums[dimension], summary.maximums[dimension])
+		}
+	}
 	return summary, nil
 }
 
@@ -83,34 +96,33 @@ func validFeatureID(raw json.RawMessage) bool {
 	if decoder.Decode(&number) != nil {
 		return false
 	}
-	_, err := number.Float64()
-	return err == nil
+	var trailing json.RawMessage
+	return decoder.Decode(&trailing) == io.EOF
 }
 
-func validateBBox(raw json.RawMessage) (int, error) {
+func validateBBox(raw json.RawMessage) (int, []float64, error) {
 	if raw == nil {
-		return 0, nil
+		return 0, nil, nil
 	}
 	var values []float64
 	if err := json.Unmarshal(raw, &values); err != nil {
-		return 0, fmt.Errorf("expected an array of numbers: %w", err)
+		return 0, nil, fmt.Errorf("expected an array of numbers: %w", err)
 	}
-	if len(values) != 4 && len(values) != 6 {
-		return 0, fmt.Errorf("contains %d values; expected 4 for 2D or 6 for 3D", len(values))
+	if len(values) < 4 || len(values)%2 != 0 {
+		return 0, nil, fmt.Errorf("contains %d values; expected two values for each of at least two coordinate dimensions", len(values))
 	}
 	for index, value := range values {
 		if math.IsNaN(value) || math.IsInf(value, 0) {
-			return 0, fmt.Errorf("value %d is not finite: %v", index, value)
+			return 0, nil, fmt.Errorf("value %d is not finite: %v", index, value)
 		}
 	}
 	dimension := len(values) / 2
-	if values[1] > values[dimension+1] {
-		return 0, fmt.Errorf("minimum latitude %v exceeds maximum latitude %v", values[1], values[dimension+1])
+	for index := 1; index < dimension; index++ {
+		if values[index] > values[dimension+index] {
+			return 0, nil, fmt.Errorf("minimum dimension %d value %v exceeds maximum %v", index+1, values[index], values[dimension+index])
+		}
 	}
-	if dimension == 3 && values[2] > values[5] {
-		return 0, fmt.Errorf("minimum third coordinate %v exceeds maximum third coordinate %v", values[2], values[5])
-	}
-	return dimension, nil
+	return dimension, values, nil
 }
 
 func inspectGeometry(raw json.RawMessage, options ValidationOptions, path string) (GeometrySummary, error) {
@@ -276,8 +288,15 @@ func positionsEqual(first, second []float64) bool {
 func addPosition(summary *GeometrySummary, position []float64) {
 	if summary.CoordinateDimension == 0 {
 		summary.CoordinateDimension = len(position)
+		summary.minimums = append([]float64(nil), position...)
+		summary.maximums = append([]float64(nil), position...)
 	} else if summary.CoordinateDimension != len(position) {
 		summary.mixedDimensions = true
+	} else {
+		for dimension, value := range position {
+			summary.minimums[dimension] = math.Min(summary.minimums[dimension], value)
+			summary.maximums[dimension] = math.Max(summary.maximums[dimension], value)
+		}
 	}
 	longitude := position[0]
 	latitude := position[1]
@@ -297,8 +316,15 @@ func mergeGeometrySummary(target *GeometrySummary, source GeometrySummary) {
 	target.PositionCount += source.PositionCount
 	if target.CoordinateDimension == 0 {
 		target.CoordinateDimension = source.CoordinateDimension
+		target.minimums = append([]float64(nil), source.minimums...)
+		target.maximums = append([]float64(nil), source.maximums...)
 	} else if source.CoordinateDimension != 0 && target.CoordinateDimension != source.CoordinateDimension {
 		target.mixedDimensions = true
+	} else if source.CoordinateDimension != 0 {
+		for dimension := range source.minimums {
+			target.minimums[dimension] = math.Min(target.minimums[dimension], source.minimums[dimension])
+			target.maximums[dimension] = math.Max(target.maximums[dimension], source.maximums[dimension])
+		}
 	}
 	target.mixedDimensions = target.mixedDimensions || source.mixedDimensions
 	if !source.HasBounds {

@@ -90,8 +90,12 @@ func extractMBTile(database *sql.DB, output io.Writer, zoom, x, y uint) error {
 	if err != nil {
 		return fmt.Errorf("MBTiles XYZ tile %d/%d/%d cannot be read: %w", zoom, x, y, err)
 	}
-	if _, err := output.Write(data); err != nil {
+	written, err := output.Write(data)
+	if err != nil {
 		return fmt.Errorf("MBTiles XYZ tile %d/%d/%d containing %d bytes cannot be written: %w", zoom, x, y, len(data), err)
+	}
+	if written != len(data) {
+		return fmt.Errorf("MBTiles XYZ tile %d/%d/%d wrote %d of %d bytes: %w", zoom, x, y, written, len(data), io.ErrShortWrite)
 	}
 	return nil
 }

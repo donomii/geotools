@@ -20,7 +20,8 @@ func TestEncodingSimple(t *testing.T) {
 	assert.Equal(t, expectedBytes, byteval)
 
 	// decode
-	var latlon = bytesToLatLon(byteval)
+	latlon, err := bytesToLatLon(byteval)
+	assert.NoError(t, err)
 	assert.Equal(t, expectedLatlon, latlon)
 }
 
@@ -36,7 +37,8 @@ func TestEncodingFloatPrecision(t *testing.T) {
 	assert.Equal(t, expectedBytes, byteval)
 
 	// decode
-	var latlon = bytesToLatLon(byteval)
+	latlon, err := bytesToLatLon(byteval)
+	assert.NoError(t, err)
 	assert.Equal(t, expectedLatlon, latlon)
 }
 
@@ -53,7 +55,8 @@ func TestEncodingBitmaskValues(t *testing.T) {
 	assert.Equal(t, expectedBytes, byteval)
 
 	// decode
-	var latlon = bytesToLatLon(byteval)
+	latlon, err := bytesToLatLon(byteval)
+	assert.NoError(t, err)
 	assert.Equal(t, expectedLatlon, latlon)
 }
 
@@ -67,8 +70,21 @@ func TestEncodingAndDecodingIdsToBytes(t *testing.T) {
 	// assert.Equal(t, expectedBytes, byteval)
 
 	// decode
-	var decoded = bytesToIDSlice(encoded)
+	decoded, err := bytesToIDSlice(encoded)
+	assert.NoError(t, err)
 	assert.Equal(t, decoded, ids)
+}
+
+func TestCacheDecodersRejectMalformedRecords(t *testing.T) {
+	if _, err := bytesToLatLon(make([]byte, 11)); err == nil {
+		t.Fatal("accepted an 11-byte cached node coordinate")
+	}
+	if _, err := bytesToLatLon(make([]byte, 14)); err == nil {
+		t.Fatal("accepted a 14-byte cached node coordinate")
+	}
+	if _, err := bytesToIDSlice(make([]byte, 7)); err == nil {
+		t.Fatal("accepted cached way node references not divisible into 8-byte identifiers")
+	}
 }
 
 func BenchmarkBytesToLatLon(b *testing.B) {
@@ -85,7 +101,9 @@ func BenchmarkBytesToLatLon(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		bytesToLatLon(data)
+		if _, err := bytesToLatLon(data); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -123,6 +141,8 @@ func BenchmarkBytesToIDSlice(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		bytesToIDSlice(data)
+		if _, err := bytesToIDSlice(data); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

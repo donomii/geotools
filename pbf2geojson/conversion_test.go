@@ -13,7 +13,6 @@ import (
 
 	"github.com/qedus/osmpbf"
 	"github.com/qedus/osmpbf/OSMPBF"
-	"github.com/syndtr/goleveldb/leveldb"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -101,6 +100,45 @@ func TestConvertPBFStrictMultipolygonWithInnerRing(t *testing.T) {
 	if len(rings) != 2 || len(rings[0]) != 5 || len(rings[1]) != 5 {
 		t.Fatalf("multipolygon rings are %#v", rings)
 	}
+	if ringSignedArea(rings[0]) <= 0 || ringSignedArea(rings[1]) >= 0 {
+		t.Fatalf("multipolygon ring winding is outer=%v inner=%v; expected counterclockwise outer and clockwise inner", ringSignedArea(rings[0]), ringSignedArea(rings[1]))
+	}
+}
+
+func TestPBFClosedWayGeometryUsesAreaTags(t *testing.T) {
+	coordinates := [][]float64{{0, 0}, {0, 1}, {1, 1}, {1, 0}, {0, 0}}
+	tests := []struct {
+		name     string
+		tags     map[string]string
+		expected string
+	}{
+		{name: "building", tags: map[string]string{"building": "yes"}, expected: "Polygon"},
+		{name: "roundabout", tags: map[string]string{"highway": "primary", "junction": "roundabout"}, expected: "LineString"},
+		{name: "explicit area", tags: map[string]string{"highway": "pedestrian", "area": "yes"}, expected: "Polygon"},
+		{name: "explicit line", tags: map[string]string{"building": "yes", "area": "no"}, expected: "LineString"},
+		{name: "linear natural feature", tags: map[string]string{"natural": "coastline"}, expected: "LineString"},
+		{name: "untagged", expected: "LineString"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			geometry, err := geometryFromCoordinates(coordinates, test.tags)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if geometry.Type != test.expected {
+				t.Fatalf("closed way became %s, expected %s", geometry.Type, test.expected)
+			}
+			if geometry.Type == "Polygon" {
+				var rings [][][]float64
+				if err := json.Unmarshal(geometry.Coordinates, &rings); err != nil {
+					t.Fatal(err)
+				}
+				if ringSignedArea(rings[0]) <= 0 {
+					t.Fatalf("polygon outer ring has signed area %v; expected counterclockwise winding", ringSignedArea(rings[0]))
+				}
+			}
+		})
+	}
 }
 
 func TestPBFDecoderReportsTruncatedData(t *testing.T) {
@@ -111,6 +149,62 @@ func TestPBFDecoderReportsTruncatedData(t *testing.T) {
 	}
 	if err := validatePBFFraming(bytes.NewReader(data)); err != nil {
 		t.Fatalf("valid PBF failed framing validation: %v", err)
+	}
+}
+
+func TestPBFNodeRejectsCoordinatesOutsideWGS84(t *testing.T) {
+	tests := []*osmpbf.Node{
+		{ID: 1, Lat: math.NaN(), Lon: 0},
+		{ID: 2, Lat: 91, Lon: 0},
+		{ID: 3, Lat: 0, Lon: -181},
+		{ID: 4, Lat: 0, Lon: math.Inf(1)},
+	}
+	for _, node := range tests {
+		if _, err := newNodeFeature(node); err == nil {
+			t.Fatalf("accepted PBF node %d at latitude %v longitude %v", node.ID, node.Lat, node.Lon)
+		}
+	}
+}
+
+func TestPBFMemoryAndDiskCachesResolveWays(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		path string
+	}{
+		{name: "memory"},
+		{name: "disk", path: filepath.Join(t.TempDir(), "leveldb")},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			cache, err := openPBFFeatureCache(testCase.path, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first := &osmpbf.Node{ID: 10, Lat: 1.25, Lon: 103.5}
+			second := &osmpbf.Node{ID: 11, Lat: 1.5, Lon: 104.0}
+			way := &osmpbf.Way{ID: 20, NodeIDs: []int64{10, 11}}
+			if err := cache.PutNode(first); err != nil {
+				t.Fatal(err)
+			}
+			if err := cache.PutNode(second); err != nil {
+				t.Fatal(err)
+			}
+			if err := cache.PutWay(way); err != nil {
+				t.Fatal(err)
+			}
+			if err := cache.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			nodes, err := cache.LookupWayNodes(way.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(nodes) != 2 || nodes[0]["lat"] != "1.2500000" || nodes[1]["lon"] != "104.0000000" {
+				t.Fatalf("resolved way nodes are %#v", nodes)
+			}
+			if err := cache.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -150,11 +244,7 @@ func convertPBFForTest(t *testing.T, tagExpression string, strictOutput, include
 			}
 		}
 	}
-	database, err := leveldb.OpenFile(filepath.Join(t.TempDir(), "leveldb"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
+	cache := newMemoryFeatureCache()
 	seekTestPBF(t, file)
 	outputDecoder := startTestPBFDecoder(t, file)
 	var output bytes.Buffer
@@ -162,10 +252,13 @@ func convertPBFForTest(t *testing.T, tagExpression string, strictOutput, include
 	if err := writer.Start(); err != nil {
 		t.Fatal(err)
 	}
-	if err := print(outputDecoder, masks, database, config, writer); err != nil {
+	if err := print(outputDecoder, masks, cache, config, writer); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Close(); err != nil {
 		t.Fatal(err)
 	}
 	return output.String()

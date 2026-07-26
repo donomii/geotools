@@ -93,12 +93,14 @@ type entiretyOutputs struct {
 	all       []*entiretyFile
 }
 
+const entiretyOutputBufferSize = 64 * 1024
+
 func openEntiretyFile(name string) (*entiretyFile, error) {
 	file, err := os.Create(name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Entirety output %q: %w", name, err)
 	}
-	return &entiretyFile{name: name, file: file, writer: bufio.NewWriterSize(file, 10*1024*1024)}, nil
+	return &entiretyFile{name: name, file: file, writer: bufio.NewWriterSize(file, entiretyOutputBufferSize)}, nil
 }
 
 func openEntiretyOutputs(mapName string) (*entiretyOutputs, error) {
@@ -282,11 +284,14 @@ func entiretyPoint(feature entiretyFeature) (float64, float64, string, bool, err
 	if err := json.Unmarshal(feature.Geometry.Coordinates, &coordinates); err != nil {
 		return 0, 0, "", false, fmt.Errorf("Point has invalid coordinates: %w", err)
 	}
-	if len(coordinates) < 2 {
-		return 0, 0, "", false, fmt.Errorf("Point has %d coordinates; expected at least longitude and latitude", len(coordinates))
+	if len(coordinates) != 2 {
+		return 0, 0, "", false, fmt.Errorf("Point has %d coordinates; Entirety requires exactly longitude and latitude", len(coordinates))
 	}
 	if math.IsNaN(coordinates[0]) || math.IsInf(coordinates[0], 0) || math.IsNaN(coordinates[1]) || math.IsInf(coordinates[1], 0) {
 		return 0, 0, "", false, fmt.Errorf("Point coordinates must be finite, received [%v, %v]", coordinates[0], coordinates[1])
+	}
+	if coordinates[0] < -180 || coordinates[0] > 180 || coordinates[1] < -90 || coordinates[1] > 90 {
+		return 0, 0, "", false, fmt.Errorf("Point coordinates [%v, %v] are outside WGS84 longitude [-180, 180] and latitude [-90, 90]", coordinates[0], coordinates[1])
 	}
 	nameRaw, hasName := feature.Properties["name"]
 	if !hasName || bytes.Equal(bytes.TrimSpace(nameRaw), []byte("null")) {
@@ -465,11 +470,8 @@ func main() {
 	}
 	count, convertErr := convertEntirety(os.Stdin, outputs, *limit, *pointsOnly, *tagsOnly)
 	closeErr := closeEntiretyOutputs(outputs)
-	if convertErr != nil {
-		log.Fatal(convertErr)
-	}
-	if closeErr != nil {
-		log.Fatal(closeErr)
+	if err := errors.Join(convertErr, closeErr); err != nil {
+		log.Fatal(err)
 	}
 	log.Printf("Converted %d Features into Entirety map files with prefix %q", count, *mapName)
 }

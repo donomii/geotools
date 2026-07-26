@@ -3,18 +3,19 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/bzip2"
 	"compress/gzip"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"strconv"
 	"strings"
-
-	"github.com/donomii/goof"
 )
 
 var strict bool
@@ -124,7 +125,7 @@ func (writer *osmFeatureWriter) Close() error {
 
 type osmStoredWay struct {
 	Coordinates [][]float64
-	Geometry    osmGeometry
+	Tags        map[string]string
 }
 
 type osmRelationSegment struct {
@@ -133,6 +134,193 @@ type osmRelationSegment struct {
 }
 
 func convertOSM(input io.Reader, output io.Writer, strictOutput bool) error {
+	if seeker, ok := input.(io.ReadSeeker); ok {
+		start, err := seeker.Seek(0, io.SeekCurrent)
+		if err == nil {
+			index, err := indexOSMReferences(seeker)
+			if err != nil {
+				return err
+			}
+			if _, err := seeker.Seek(start, io.SeekStart); err != nil {
+				return fmt.Errorf("failed to rewind OSM XML stream to byte %d: %w", start, err)
+			}
+			return convertIndexedOSM(seeker, output, strictOutput, index)
+		}
+	}
+	return convertStreamingOSM(input, output, strictOutput)
+}
+
+type osmReferenceIndex struct {
+	nodeUses     map[int64]int
+	relationWays map[int64]bool
+	relations    []osmXMLRelation
+	relationByID map[int64]osmXMLRelation
+}
+
+func indexOSMReferences(input io.Reader) (*osmReferenceIndex, error) {
+	index := &osmReferenceIndex{
+		nodeUses:     make(map[int64]int),
+		relationWays: make(map[int64]bool),
+		relationByID: make(map[int64]osmXMLRelation),
+	}
+	decoder := xml.NewDecoder(input)
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			return index, nil
+		} else if err != nil {
+			return nil, fmt.Errorf("failed to index OSM XML references: %w", err)
+		}
+		start, ok := token.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		switch start.Name.Local {
+		case "node":
+			if err := decoder.Skip(); err != nil {
+				return nil, fmt.Errorf("failed to index OSM node: %w", err)
+			}
+		case "way":
+			var way osmXMLWay
+			if err := decoder.DecodeElement(&way, &start); err != nil {
+				return nil, fmt.Errorf("failed to index OSM way: %w", err)
+			}
+			for _, reference := range way.NodeReferences {
+				nodeID, err := osmNumericID(reference.Reference, "node reference")
+				if err != nil {
+					return nil, fmt.Errorf("OSM way %s: %w", way.ID, err)
+				}
+				index.nodeUses[nodeID]++
+			}
+		case "relation":
+			var relation osmXMLRelation
+			if err := decoder.DecodeElement(&relation, &start); err != nil {
+				return nil, fmt.Errorf("failed to index OSM relation: %w", err)
+			}
+			relationID, err := osmNumericID(relation.ID, "relation")
+			if err != nil {
+				return nil, err
+			}
+			index.relations = append(index.relations, relation)
+			index.relationByID[relationID] = relation
+			for _, member := range relation.Members {
+				memberID, err := osmNumericID(member.Reference, "relation member "+member.Type)
+				if err != nil {
+					return nil, fmt.Errorf("OSM relation %s: %w", relation.ID, err)
+				}
+				switch member.Type {
+				case "node":
+					index.nodeUses[memberID]++
+				case "way":
+					index.relationWays[memberID] = true
+				case "relation":
+				default:
+					return nil, fmt.Errorf("OSM relation %s has unknown member type %q", relation.ID, member.Type)
+				}
+			}
+		}
+	}
+}
+
+func convertIndexedOSM(input io.Reader, output io.Writer, strictOutput bool, index *osmReferenceIndex) error {
+	writer := newOSMFeatureWriter(output, strictOutput)
+	if err := writer.Start(); err != nil {
+		return err
+	}
+	nodes := make(map[int64][2]float64, len(index.nodeUses))
+	ways := make(map[int64]osmStoredWay, len(index.relationWays))
+	remainingNodeUses := make(map[int64]int, len(index.nodeUses))
+	for nodeID, count := range index.nodeUses {
+		remainingNodeUses[nodeID] = count
+	}
+	decoder := xml.NewDecoder(input)
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return fmt.Errorf("failed to decode OSM XML: %w", err)
+		}
+		start, ok := token.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		switch start.Name.Local {
+		case "node":
+			var node osmXMLNode
+			if err := decoder.DecodeElement(&node, &start); err != nil {
+				return fmt.Errorf("failed to decode OSM node: %w", err)
+			}
+			feature, position, err := osmNodeFeature(node)
+			if err != nil {
+				return err
+			}
+			nodeID, err := osmNumericID(node.ID, "node")
+			if err != nil {
+				return err
+			}
+			if remainingNodeUses[nodeID] > 0 {
+				nodes[nodeID] = position
+			}
+			if err := writer.Write(feature); err != nil {
+				return err
+			}
+		case "way":
+			var way osmXMLWay
+			if err := decoder.DecodeElement(&way, &start); err != nil {
+				return fmt.Errorf("failed to decode OSM way: %w", err)
+			}
+			feature, stored, err := osmWayFeature(way, nodes)
+			if err != nil {
+				return err
+			}
+			wayID, err := osmNumericID(way.ID, "way")
+			if err != nil {
+				return err
+			}
+			if index.relationWays[wayID] {
+				ways[wayID] = stored
+			}
+			if err := releaseOSMWayNodes(way, remainingNodeUses, nodes); err != nil {
+				return err
+			}
+			if err := writer.Write(feature); err != nil {
+				return err
+			}
+		case "relation":
+			if err := decoder.Skip(); err != nil {
+				return fmt.Errorf("failed to decode OSM relation: %w", err)
+			}
+		}
+	}
+	for _, relation := range index.relations {
+		feature, err := osmRelationFeature(relation, nodes, ways, index.relationByID)
+		if err != nil {
+			return err
+		}
+		if err := writer.Write(feature); err != nil {
+			return err
+		}
+	}
+	return writer.Close()
+}
+
+func releaseOSMWayNodes(way osmXMLWay, remainingUses map[int64]int, nodes map[int64][2]float64) error {
+	for _, reference := range way.NodeReferences {
+		nodeID, err := osmNumericID(reference.Reference, "node reference")
+		if err != nil {
+			return fmt.Errorf("OSM way %s: %w", way.ID, err)
+		}
+		remainingUses[nodeID]--
+		if remainingUses[nodeID] == 0 {
+			delete(remainingUses, nodeID)
+			delete(nodes, nodeID)
+		}
+	}
+	return nil
+}
+
+func convertStreamingOSM(input io.Reader, output io.Writer, strictOutput bool) error {
 	writer := newOSMFeatureWriter(output, strictOutput)
 	if err := writer.Start(); err != nil {
 		return err
@@ -229,6 +417,12 @@ func osmNodeFeature(node osmXMLNode) (osmFeature, [2]float64, error) {
 	if err != nil {
 		return osmFeature{}, [2]float64{}, fmt.Errorf("OSM node %s has invalid longitude %q: %w", node.ID, node.Lon, err)
 	}
+	if math.IsNaN(lon) || math.IsInf(lon, 0) || lon < -180 || lon > 180 {
+		return osmFeature{}, [2]float64{}, fmt.Errorf("OSM node %s longitude %q is outside -180 through 180", node.ID, node.Lon)
+	}
+	if math.IsNaN(lat) || math.IsInf(lat, 0) || lat < -90 || lat > 90 {
+		return osmFeature{}, [2]float64{}, fmt.Errorf("OSM node %s latitude %q is outside -90 through 90", node.ID, node.Lat)
+	}
 	position := [2]float64{lon, lat}
 	encoded, err := json.Marshal(position)
 	if err != nil {
@@ -261,17 +455,18 @@ func osmWayFeature(way osmXMLWay, nodes map[int64][2]float64) (osmFeature, osmSt
 		}
 		coordinates = append(coordinates, []float64{position[0], position[1]})
 	}
-	geometry, err := osmGeometryFromCoordinates(coordinates)
+	tags := osmTags(way.Tags)
+	geometry, err := osmGeometryFromCoordinates(coordinates, tags)
 	if err != nil {
 		return osmFeature{}, osmStoredWay{}, fmt.Errorf("failed to build OSM way %s geometry: %w", way.ID, err)
 	}
-	stored := osmStoredWay{Coordinates: coordinates, Geometry: geometry}
+	stored := osmStoredWay{Coordinates: coordinates, Tags: tags}
 	return osmFeature{
 		Type:       "Feature",
 		ID:         "way/" + way.ID,
 		BBox:       osmBounds(coordinates),
 		Geometry:   geometry,
-		Properties: osmProperties{OSMType: "way", OSMID: way.ID, Tags: osmTags(way.Tags)},
+		Properties: osmProperties{OSMType: "way", OSMID: way.ID, Tags: tags},
 	}, stored, nil
 }
 
@@ -331,7 +526,11 @@ func osmRelationCollection(relation osmXMLRelation, nodes map[int64][2]float64, 
 			if !ok {
 				return osmGeometry{}, fmt.Errorf("member way %s was not found", member.Reference)
 			}
-			geometries = append(geometries, way.Geometry)
+			geometry, err := osmGeometryFromCoordinates(way.Coordinates, way.Tags)
+			if err != nil {
+				return osmGeometry{}, fmt.Errorf("member way %s has invalid geometry: %w", member.Reference, err)
+			}
+			geometries = append(geometries, geometry)
 		case "relation":
 			relationID, err := osmNumericID(member.Reference, "nested relation")
 			if err != nil {
@@ -429,9 +628,11 @@ func osmMultipolygonGeometry(segments []osmRelationSegment) (osmGeometry, error)
 	}
 	polygons := make([][][][]float64, len(outerRings))
 	for index, ring := range outerRings {
-		polygons[index] = [][][]float64{ring}
+		outerRings[index] = osmNormalizeRing(ring, false)
+		polygons[index] = [][][]float64{outerRings[index]}
 	}
 	for _, inner := range innerRings {
+		inner = osmNormalizeRing(inner, true)
 		assigned := false
 		for index, outer := range outerRings {
 			if osmPointInRing(inner[0], outer) {
@@ -540,16 +741,57 @@ func osmPointInRing(point []float64, ring [][]float64) bool {
 	return inside
 }
 
-func osmGeometryFromCoordinates(coordinates [][]float64) (osmGeometry, error) {
+func osmGeometryFromCoordinates(coordinates [][]float64, tags map[string]string) (osmGeometry, error) {
 	if len(coordinates) < 2 {
 		return osmGeometry{}, fmt.Errorf("expected at least two positions")
 	}
-	if len(coordinates) >= 4 && osmPositionsEqual(coordinates[0], coordinates[len(coordinates)-1]) {
-		encoded, err := json.Marshal([][][]float64{coordinates})
+	if len(coordinates) >= 4 && osmPositionsEqual(coordinates[0], coordinates[len(coordinates)-1]) && osmWayIsArea(tags) {
+		encoded, err := json.Marshal([][][]float64{osmNormalizeRing(coordinates, false)})
 		return osmGeometry{Type: "Polygon", Coordinates: encoded}, err
 	}
 	encoded, err := json.Marshal(coordinates)
 	return osmGeometry{Type: "LineString", Coordinates: encoded}, err
+}
+
+func osmWayIsArea(tags map[string]string) bool {
+	if area, exists := tags["area"]; exists {
+		return area != "no" && area != "false" && area != "0"
+	}
+	for key, value := range tags {
+		switch key {
+		case "aeroway", "amenity", "area:highway", "building", "building:part", "craft", "geological", "historic",
+			"indoor", "landuse", "leisure", "military", "office", "place", "public_transport", "shop", "sport",
+			"tourism", "water", "wetland":
+			if value != "" && value != "no" {
+				return true
+			}
+		}
+	}
+	if natural := tags["natural"]; natural != "" && natural != "no" {
+		return natural != "coastline" && natural != "cliff" && natural != "ridge" && natural != "tree_row"
+	}
+	if manMade := tags["man_made"]; manMade != "" && manMade != "no" {
+		return manMade != "cutline" && manMade != "embankment" && manMade != "pipeline"
+	}
+	if power := tags["power"]; power != "" && power != "no" {
+		return power != "line" && power != "minor_line" && power != "cable"
+	}
+	return false
+}
+
+func osmRingSignedArea(ring [][]float64) float64 {
+	area := 0.0
+	for index := 0; index+1 < len(ring); index++ {
+		area += ring[index][0]*ring[index+1][1] - ring[index+1][0]*ring[index][1]
+	}
+	return area / 2
+}
+
+func osmNormalizeRing(ring [][]float64, clockwise bool) [][]float64 {
+	if (osmRingSignedArea(ring) < 0) == clockwise {
+		return ring
+	}
+	return osmReverseCoordinates(ring)
 }
 
 func osmBounds(coordinates [][]float64) []float64 {
@@ -581,6 +823,93 @@ func osmTags(tags []osmXMLTag) map[string]string {
 	return properties
 }
 
+type osmInput struct {
+	io.Reader
+	file       *os.File
+	compressor *gzip.Reader
+	closeFile  bool
+}
+
+func openOSMInput(filename, compression string) (*osmInput, error) {
+	selectedCompression, err := osmInputCompression(filename, compression)
+	if err != nil {
+		return nil, err
+	}
+	file := os.Stdin
+	closeFile := false
+	if filename != "" {
+		file, err = os.Open(filename)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open OSM input file %q: %w", filename, err)
+		}
+		closeFile = true
+	}
+	buffered := bufio.NewReaderSize(file, 64*1024)
+	input := &osmInput{Reader: buffered, file: file, closeFile: closeFile}
+	switch selectedCompression {
+	case "":
+	case "gz":
+		input.compressor, err = gzip.NewReader(buffered)
+		if err != nil {
+			openErr := fmt.Errorf("failed to open gzip-compressed OSM input %q: %w", filename, err)
+			if closeFile {
+				return nil, errors.Join(openErr, file.Close())
+			}
+			return nil, openErr
+		}
+		input.Reader = input.compressor
+	case "bz2":
+		input.Reader = bzip2.NewReader(buffered)
+	}
+	return input, nil
+}
+
+func osmInputCompression(filename, compression string) (string, error) {
+	selected := strings.ToLower(strings.TrimSpace(compression))
+	if selected == "" {
+		lowerName := strings.ToLower(filename)
+		if strings.HasSuffix(lowerName, ".gz") {
+			selected = "gz"
+		} else if strings.HasSuffix(lowerName, ".bz2") {
+			selected = "bz2"
+		}
+	}
+	if selected != "" && selected != "gz" && selected != "bz2" {
+		return "", fmt.Errorf("OSM input compression %q is unsupported; expected gz, bz2, or empty for filename detection", compression)
+	}
+	return selected, nil
+}
+
+func (input *osmInput) Close() error {
+	var compressorErr error
+	if input.compressor != nil {
+		compressorErr = input.compressor.Close()
+	}
+	var fileErr error
+	if input.closeFile {
+		fileErr = input.file.Close()
+	}
+	return errors.Join(compressorErr, fileErr)
+}
+
+func convertOSMFile(filename, compression string, output io.Writer, strictOutput bool) error {
+	firstPass, err := openOSMInput(filename, compression)
+	if err != nil {
+		return err
+	}
+	index, indexErr := indexOSMReferences(firstPass)
+	firstCloseErr := firstPass.Close()
+	if indexErr != nil || firstCloseErr != nil {
+		return errors.Join(indexErr, firstCloseErr)
+	}
+	secondPass, err := openOSMInput(filename, compression)
+	if err != nil {
+		return err
+	}
+	convertErr := convertIndexedOSM(secondPass, output, strictOutput, index)
+	return errors.Join(convertErr, secondPass.Close())
+}
+
 type osmOutputDestination struct {
 	writer     io.Writer
 	file       *os.File
@@ -604,15 +933,15 @@ func openOSMOutput(filename string) (*osmOutputDestination, error) {
 }
 
 func (destination *osmOutputDestination) Close() error {
+	var compressorErr error
 	if destination.compressor != nil {
-		if err := destination.compressor.Close(); err != nil {
-			return err
-		}
+		compressorErr = destination.compressor.Close()
 	}
+	var fileErr error
 	if destination.file != nil {
-		return destination.file.Close()
+		fileErr = destination.file.Close()
 	}
-	return nil
+	return errors.Join(compressorErr, fileErr)
 }
 
 func runOSMBuiltInTests() error {
@@ -671,17 +1000,22 @@ func main() {
 	if len(args) > 1 {
 		outputFilename = args[1]
 	}
-	input := goof.OpenBufferedInput(inputFilename, compression)
 	output, err := openOSMOutput(outputFilename)
 	if err != nil {
 		log.Fatal(err)
 	}
-	convertErr := convertOSM(input, output.writer, strict)
-	closeErr := output.Close()
-	if convertErr != nil {
-		log.Fatal(convertErr)
+	var convertErr error
+	if inputFilename == "" {
+		input, err := openOSMInput("", compression)
+		if err != nil {
+			log.Fatal(err)
+		}
+		convertErr = errors.Join(convertOSM(input, output.writer, strict), input.Close())
+	} else {
+		convertErr = convertOSMFile(inputFilename, compression, output.writer, strict)
 	}
-	if closeErr != nil {
-		log.Fatalf("failed to close OSM output: %v", closeErr)
+	closeErr := output.Close()
+	if err := errors.Join(convertErr, closeErr); err != nil {
+		log.Fatal(err)
 	}
 }

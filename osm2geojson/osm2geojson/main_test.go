@@ -128,9 +128,48 @@ func TestConvertOSMMultipolygonAndNestedRelation(t *testing.T) {
 	if len(rings) != 2 {
 		t.Fatalf("multipolygon contains %d rings, expected outer and inner rings", len(rings))
 	}
+	if osmRingSignedArea(rings[0]) <= 0 || osmRingSignedArea(rings[1]) >= 0 {
+		t.Fatalf("multipolygon ring winding is outer=%v inner=%v; expected counterclockwise outer and clockwise inner", osmRingSignedArea(rings[0]), osmRingSignedArea(rings[1]))
+	}
 	nested := featureByID(t, collection.Features, "relation/21")
 	if nested.Geometry.Type != "GeometryCollection" || len(nested.Geometry.Geometries) != 2 {
 		t.Fatalf("nested relation geometry is %#v", nested.Geometry)
+	}
+}
+
+func TestOSMClosedWayGeometryUsesAreaTags(t *testing.T) {
+	coordinates := [][]float64{{0, 0}, {0, 1}, {1, 1}, {1, 0}, {0, 0}}
+	tests := []struct {
+		name     string
+		tags     map[string]string
+		expected string
+	}{
+		{name: "building", tags: map[string]string{"building": "yes"}, expected: "Polygon"},
+		{name: "roundabout", tags: map[string]string{"highway": "primary", "junction": "roundabout"}, expected: "LineString"},
+		{name: "explicit area", tags: map[string]string{"highway": "pedestrian", "area": "yes"}, expected: "Polygon"},
+		{name: "explicit line", tags: map[string]string{"building": "yes", "area": "no"}, expected: "LineString"},
+		{name: "linear natural feature", tags: map[string]string{"natural": "coastline"}, expected: "LineString"},
+		{name: "untagged", expected: "LineString"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			geometry, err := osmGeometryFromCoordinates(coordinates, test.tags)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if geometry.Type != test.expected {
+				t.Fatalf("closed way became %s, expected %s", geometry.Type, test.expected)
+			}
+			if geometry.Type == "Polygon" {
+				var rings [][][]float64
+				if err := json.Unmarshal(geometry.Coordinates, &rings); err != nil {
+					t.Fatal(err)
+				}
+				if osmRingSignedArea(rings[0]) <= 0 {
+					t.Fatalf("polygon outer ring has signed area %v; expected counterclockwise winding", osmRingSignedArea(rings[0]))
+				}
+			}
+		})
 	}
 }
 
@@ -139,6 +178,20 @@ func TestConvertOSMRejectsMissingNodeReference(t *testing.T) {
 	err := convertOSM(strings.NewReader(input), io.Discard, false)
 	if err == nil || !strings.Contains(err.Error(), "way 7 references missing node 99") {
 		t.Fatalf("received error %v", err)
+	}
+}
+
+func TestOSMNodeRejectsCoordinatesOutsideWGS84(t *testing.T) {
+	tests := []osmXMLNode{
+		{ID: "1", Lat: "NaN", Lon: "0"},
+		{ID: "2", Lat: "91", Lon: "0"},
+		{ID: "3", Lat: "0", Lon: "-181"},
+		{ID: "4", Lat: "0", Lon: "Inf"},
+	}
+	for _, node := range tests {
+		if _, _, err := osmNodeFeature(node); err == nil {
+			t.Fatalf("accepted OSM node %s at latitude %q longitude %q", node.ID, node.Lat, node.Lon)
+		}
 	}
 }
 
@@ -152,6 +205,73 @@ func TestConvertOSMPreservesEmptyTagValue(t *testing.T) {
 	value, exists := feature.Properties.Tags["name"]
 	if !exists || value != "" {
 		t.Fatalf("empty name tag was not preserved: %#v", feature.Properties.Tags)
+	}
+}
+
+func TestSeekableAndStreamingOSMConversionsMatch(t *testing.T) {
+	var indexedOutput bytes.Buffer
+	if err := convertOSM(strings.NewReader(relationOSM), &indexedOutput, true); err != nil {
+		t.Fatal(err)
+	}
+	var streamingOutput bytes.Buffer
+	input := struct{ io.Reader }{strings.NewReader(relationOSM)}
+	if err := convertOSM(input, &streamingOutput, true); err != nil {
+		t.Fatal(err)
+	}
+	if indexedOutput.String() != streamingOutput.String() {
+		t.Fatalf("seekable and streaming conversions differ:\nseekable: %s\nstreaming: %s", indexedOutput.String(), streamingOutput.String())
+	}
+}
+
+func TestOSMReferenceIndexExcludesUnreferencedNodesAndWays(t *testing.T) {
+	input := `<osm>
+<node id="1" lat="0" lon="0"/><node id="2" lat="1" lon="1"/><node id="99" lat="2" lon="2"/>
+<way id="10"><nd ref="1"/><nd ref="2"/></way><way id="11"><nd ref="2"/><nd ref="1"/></way>
+<relation id="20"><member type="way" ref="10" role=""/><member type="node" ref="2" role="label"/></relation>
+</osm>`
+	index, err := indexOSMReferences(strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if index.nodeUses[1] != 2 || index.nodeUses[2] != 3 {
+		t.Fatalf("node reference counts are %#v", index.nodeUses)
+	}
+	if _, exists := index.nodeUses[99]; exists {
+		t.Fatalf("unreferenced node 99 was indexed: %#v", index.nodeUses)
+	}
+	if !index.relationWays[10] || index.relationWays[11] {
+		t.Fatalf("relation way set is %#v", index.relationWays)
+	}
+}
+
+func TestConvertGzipOSMFileWithoutScratchStorage(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "vancouver.osm.gz")
+	file, err := os.Create(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressor := gzip.NewWriter(file)
+	if _, err := compressor.Write([]byte(realVancouverOSM)); err != nil {
+		t.Fatal(err)
+	}
+	if err := compressor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := convertOSMFile(filename, "", &output, true); err != nil {
+		t.Fatal(err)
+	}
+	var collection struct {
+		Features []osmFeature `json:"features"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &collection); err != nil {
+		t.Fatal(err)
+	}
+	if len(collection.Features) != 7 {
+		t.Fatalf("gzip OSM conversion emitted %d Features", len(collection.Features))
 	}
 }
 

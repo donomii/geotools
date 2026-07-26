@@ -62,6 +62,7 @@ func main() {
 	layerProperty := flag.String("layer-property", "mvt_layer", "Property receiving each source layer name with -all-layers; empty omits layer identity")
 	idProperty := flag.String("id-property", geodata.DefaultMVTIDProperty, "MVT string property containing an exact GeoJSON Feature id; restored and removed when present, empty disables restoration")
 	gzipInput := flag.Bool("gzip", false, "Read a gzip-compressed MVT tile instead of an uncompressed tile")
+	maxInputBytes := flag.Int64("max-input-bytes", geodata.DefaultMVTMaxInputBytes, "Maximum decoded tile size in bytes; gzip input is limited after decompression to bound memory use")
 	outputName := flag.String("output", "jsonl", "GeoJSON output format: jsonl writes one Feature per line, collection writes a FeatureCollection, and seq writes RFC 8142 records")
 	runTest := flag.Bool("test", false, "Run an in-memory MVT-to-GeoJSON decode check and exit")
 	flag.Parse()
@@ -79,7 +80,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	settings := decodeSettings{Zoom: *zoom, X: *x, Y: *y, Layer: *layer, Gzip: *gzipInput, AllLayers: *allLayers, LayerProperty: *layerProperty, IDProperty: *idProperty}
+	settings := decodeSettings{Zoom: *zoom, X: *x, Y: *y, Layer: *layer, Gzip: *gzipInput, AllLayers: *allLayers, LayerProperty: *layerProperty, IDProperty: *idProperty, MaxInputBytes: *maxInputBytes}
 	if err := decodeVectorTile(os.Stdin, os.Stdout, outputMode, settings); err != nil {
 		log.Fatal(err)
 	}

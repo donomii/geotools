@@ -2,7 +2,11 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode"
@@ -103,6 +107,45 @@ func TestParsePageWordsRejectsPageWithoutRevision(t *testing.T) {
 	}
 }
 
+func TestOpenWikipediaInputReadsGzipAndReturnsErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pages.xml.gz")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressor := gzip.NewWriter(file)
+	if _, err := compressor.Write([]byte("wikipedia payload")); err != nil {
+		t.Fatal(err)
+	}
+	if err := compressor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	input, err := openWikipediaInput(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(input)
+	closeErr := input.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if string(data) != "wikipedia payload" {
+		t.Fatalf("gzip input decoded as %q", data)
+	}
+	if _, err := openWikipediaInput(path, "zip"); err == nil {
+		t.Fatal("accepted unsupported input compression")
+	}
+	if _, err := openWikipediaInput(filepath.Join(t.TempDir(), "missing.xml"), ""); err == nil {
+		t.Fatal("accepted a missing input file")
+	}
+}
+
 func TestWriteDocvecResultsHandlesLargeOutOfOrderWindow(t *testing.T) {
 	results := make(chan docvecPageResult, 20)
 	for sequence := int64(19); sequence >= 0; sequence-- {
@@ -121,6 +164,22 @@ func TestWriteDocvecResultsHandlesLargeOutOfOrderWindow(t *testing.T) {
 		if line != strings.TrimSpace(documentLine(int64(sequence))) {
 			t.Fatalf("line %d is %q", sequence, line)
 		}
+	}
+}
+
+func TestWriteDocvecResultsReleasesOrderedResultSlots(t *testing.T) {
+	results := make(chan docvecPageResult, 3)
+	slots := make(chan struct{}, 3)
+	for sequence := int64(2); sequence >= 0; sequence-- {
+		slots <- struct{}{}
+		results <- docvecPageResult{Sequence: sequence}
+	}
+	close(results)
+	if err := writeDocvecResultsWithSlots(results, &bytes.Buffer{}, slots); err != nil {
+		t.Fatal(err)
+	}
+	if len(slots) != 0 {
+		t.Fatalf("writer left %d result slots occupied", len(slots))
 	}
 }
 

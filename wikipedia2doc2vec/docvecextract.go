@@ -4,6 +4,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/bzip2"
+	"compress/gzip"
 	"encoding/gob"
 	"errors"
 	"flag"
@@ -19,8 +21,6 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/donomii/goof"
-
 	"github.com/dustin/go-humanize"
 	"github.com/dustin/go-wikiparse"
 )
@@ -28,6 +28,8 @@ import (
 var compression string
 var numWorkers int
 var limit int64
+
+const docvecResultWindow = 1000
 
 var wikiCommentPattern = regexp.MustCompile(`(?s)<!--.*?-->`)
 var wikiReferencePattern = regexp.MustCompile(`(?is)<ref\b[^>]*>.*?</ref>|<ref\b[^>]*/>`)
@@ -136,9 +138,11 @@ func errorHandler(pages <-chan *wikiparse.Page) error {
 
 func process(parser wikiparse.Parser, output io.Writer) error {
 	log.Printf("Got site info:  %+v", parser.SiteInfo())
-	tasks := make(chan docvecPageTask, 1000)
-	results := make(chan docvecPageResult, 1000)
+	queueSize := numWorkers * 2
+	tasks := make(chan docvecPageTask, queueSize)
+	results := make(chan docvecPageResult, queueSize)
 	errorPages := make(chan *wikiparse.Page, 10)
+	resultSlots := make(chan struct{}, docvecResultWindow)
 	var workerGroup sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
 		workerGroup.Add(1)
@@ -146,7 +150,7 @@ func process(parser wikiparse.Parser, output io.Writer) error {
 	}
 	writerDone := make(chan error, 1)
 	go func() {
-		writerDone <- writeDocvecResults(results, output)
+		writerDone <- writeDocvecResultsWithSlots(results, output, resultSlots)
 	}()
 	errorDone := make(chan error, 1)
 	go func() {
@@ -167,6 +171,7 @@ func process(parser wikiparse.Parser, output io.Writer) error {
 			parserErr = err
 			break
 		}
+		resultSlots <- struct{}{}
 		tasks <- docvecPageTask{Sequence: pages, Page: page}
 
 		pages++
@@ -199,6 +204,10 @@ func process(parser wikiparse.Parser, output io.Writer) error {
 }
 
 func writeDocvecResults(results <-chan docvecPageResult, output io.Writer) error {
+	return writeDocvecResultsWithSlots(results, output, nil)
+}
+
+func writeDocvecResultsWithSlots(results <-chan docvecPageResult, output io.Writer, resultSlots chan struct{}) error {
 	writer := bufio.NewWriter(output)
 	pending := make(map[int64]docvecPageResult)
 	nextSequence := int64(0)
@@ -217,6 +226,9 @@ func writeDocvecResults(results <-chan docvecPageResult, output io.Writer) error
 				}
 			}
 			nextSequence++
+			if resultSlots != nil {
+				<-resultSlots
+			}
 		}
 	}
 	if len(pending) != 0 {
@@ -225,12 +237,76 @@ func writeDocvecResults(results <-chan docvecPageResult, output io.Writer) error
 	return errors.Join(firstErr, writer.Flush())
 }
 
-func processSingleStream(filename string) error {
-	p, err := wikiparse.NewParser(goof.OpenInput(filename, compression))
-	if err != nil {
-		return fmt.Errorf("failed to set up Wikipedia parser for %q: %w", filename, err)
+type wikipediaInput struct {
+	io.Reader
+	file       *os.File
+	compressor *gzip.Reader
+	closeFile  bool
+}
+
+func openWikipediaInput(filename, configuredCompression string) (*wikipediaInput, error) {
+	selectedCompression := strings.ToLower(strings.TrimSpace(configuredCompression))
+	if selectedCompression == "" {
+		lowerName := strings.ToLower(filename)
+		if strings.HasSuffix(lowerName, ".gz") {
+			selectedCompression = "gz"
+		} else if strings.HasSuffix(lowerName, ".bz2") {
+			selectedCompression = "bz2"
+		}
 	}
-	return process(p, os.Stdout)
+	if selectedCompression != "" && selectedCompression != "gz" && selectedCompression != "bz2" {
+		return nil, fmt.Errorf("Wikipedia input compression %q is unsupported; expected gz, bz2, or empty for filename detection", configuredCompression)
+	}
+	file := os.Stdin
+	closeFile := false
+	var err error
+	if filename != "" {
+		file, err = os.Open(filename)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open Wikipedia input %q: %w", filename, err)
+		}
+		closeFile = true
+	}
+	buffered := bufio.NewReaderSize(file, 64*1024)
+	input := &wikipediaInput{Reader: buffered, file: file, closeFile: closeFile}
+	if selectedCompression == "gz" {
+		input.compressor, err = gzip.NewReader(buffered)
+		if err != nil {
+			openErr := fmt.Errorf("failed to open gzip-compressed Wikipedia input %q: %w", filename, err)
+			if closeFile {
+				return nil, errors.Join(openErr, file.Close())
+			}
+			return nil, openErr
+		}
+		input.Reader = input.compressor
+	} else if selectedCompression == "bz2" {
+		input.Reader = bzip2.NewReader(buffered)
+	}
+	return input, nil
+}
+
+func (input *wikipediaInput) Close() error {
+	var compressorErr error
+	if input.compressor != nil {
+		compressorErr = input.compressor.Close()
+	}
+	var fileErr error
+	if input.closeFile {
+		fileErr = input.file.Close()
+	}
+	return errors.Join(compressorErr, fileErr)
+}
+
+func processSingleStream(filename string) error {
+	input, err := openWikipediaInput(filename, compression)
+	if err != nil {
+		return err
+	}
+	p, err := wikiparse.NewParser(input)
+	if err != nil {
+		return errors.Join(fmt.Errorf("failed to set up Wikipedia parser for %q: %w", filename, err), input.Close())
+	}
+	return errors.Join(process(p, os.Stdout), input.Close())
 }
 
 func processMultiStream(idx, data string) error {
@@ -256,8 +332,8 @@ Use:
 
 		
 		wikipedia2doc2vec.exe file.xml.gz
-	
-		Read from file.xml.bz2, automatically uncompressing gz format
+
+		Read from file.xml.gz, automatically uncompressing gz format
 
 		
 		wikipedia2doc2vec.exe --compression=bz2 file
@@ -333,6 +409,9 @@ func main() {
 	}
 	if numWorkers < 1 {
 		log.Fatal("invalid workers: expected an integer greater than zero")
+	}
+	if numWorkers > docvecResultWindow {
+		log.Fatalf("invalid workers: received %d, maximum is %d", numWorkers, docvecResultWindow)
 	}
 	if cpus < 1 {
 		log.Fatal("invalid cpus: expected an integer greater than zero")

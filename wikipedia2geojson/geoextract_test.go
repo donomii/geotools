@@ -2,8 +2,12 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"io"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -116,6 +120,57 @@ func TestParsePageCoordsRejectsPageWithoutRevision(t *testing.T) {
 	}
 }
 
+func TestParsePageCoordsRejectsNonFiniteCoordinates(t *testing.T) {
+	page := &wikiparse.Page{
+		Title:     "Not a location",
+		ID:        72,
+		Revisions: []wikiparse.Revision{{Text: "{{coord|NaN|0}}"}},
+	}
+	_, _, err := parsePageCoords(page)
+	if err == nil || !strings.Contains(err.Error(), "non-finite coordinates") {
+		t.Fatalf("received error %v", err)
+	}
+}
+
+func TestOpenWikipediaInputReadsGzipAndReturnsErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pages.xml.gz")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressor := gzip.NewWriter(file)
+	if _, err := compressor.Write([]byte("wikipedia payload")); err != nil {
+		t.Fatal(err)
+	}
+	if err := compressor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	input, err := openWikipediaInput(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(input)
+	closeErr := input.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if string(data) != "wikipedia payload" {
+		t.Fatalf("gzip input decoded as %q", data)
+	}
+	if _, err := openWikipediaInput(path, "zip"); err == nil {
+		t.Fatal("accepted unsupported input compression")
+	}
+	if _, err := openWikipediaInput(filepath.Join(t.TempDir(), "missing.xml"), ""); err == nil {
+		t.Fatal("accepted a missing input file")
+	}
+}
+
 func TestWriteWikiResultsHandlesLargeOutOfOrderWindow(t *testing.T) {
 	results := make(chan wikiPageResult, 5)
 	for sequence := int64(4); sequence >= 0; sequence-- {
@@ -144,6 +199,22 @@ func TestWriteWikiResultsHandlesLargeOutOfOrderWindow(t *testing.T) {
 		if feature.Properties.Name != expected {
 			t.Fatalf("Feature %d is %q, expected %q", index, feature.Properties.Name, expected)
 		}
+	}
+}
+
+func TestWriteWikiResultsReleasesOrderedResultSlots(t *testing.T) {
+	results := make(chan wikiPageResult, 3)
+	slots := make(chan struct{}, 3)
+	for sequence := int64(2); sequence >= 0; sequence-- {
+		slots <- struct{}{}
+		results <- wikiPageResult{Sequence: sequence}
+	}
+	close(results)
+	if err := writeWikiResultsWithSlots(results, &bytes.Buffer{}, false, slots); err != nil {
+		t.Fatal(err)
+	}
+	if len(slots) != 0 {
+		t.Fatalf("writer left %d result slots occupied", len(slots))
 	}
 }
 

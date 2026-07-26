@@ -10,12 +10,15 @@ import (
 	"log"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/donomii/geotools/geodata"
 	gogamafgb "github.com/gogama/flatgeobuf/flatgeobuf"
 	"github.com/gogama/flatgeobuf/flatgeobuf/flat"
+	"github.com/gogama/flatgeobuf/packedrtree"
+	"github.com/twpayne/go-geom"
 )
 
 const preservedFeatureProperty = "__geotools_feature_json"
@@ -83,6 +86,7 @@ func encodeFlatGeobufWithSettings(input io.Reader, output io.Writer, settings fl
 		}
 		encodedFeatures = append(encodedFeatures, encoded)
 	}
+	encodedFeatures = sortFlatFeaturesForIndex(sourceFeatures, encodedFeatures)
 	indexed := len(sourceFeatures) > 0
 	header, err := buildFlatHeader(settings.LayerName, columns, sourceFeatures, indexed, targetCRS, dimension)
 	if err != nil {
@@ -103,6 +107,33 @@ func encodeFlatGeobufWithSettings(input io.Reader, output io.Writer, settings fl
 		return fmt.Errorf("failed to finish FlatGeobuf output after %d Features: %w", len(sourceFeatures), err)
 	}
 	return nil
+}
+
+func sortFlatFeaturesForIndex(sourceFeatures []flatSourceFeature, encodedFeatures []flat.Feature) []flat.Feature {
+	if len(sourceFeatures) < 2 {
+		return encodedFeatures
+	}
+	refs := make([]packedrtree.Ref, len(sourceFeatures))
+	allBounds := packedrtree.EmptyBox
+	for index, source := range sourceFeatures {
+		bounds := source.Geometry.Bounds()
+		refs[index] = packedrtree.Ref{
+			Box: packedrtree.Box{
+				XMin: bounds.Min(0),
+				YMin: bounds.Min(1),
+				XMax: bounds.Max(0),
+				YMax: bounds.Max(1),
+			},
+			Offset: int64(index),
+		}
+		allBounds.Expand(&refs[index].Box)
+	}
+	packedrtree.HilbertSort(refs, allBounds)
+	sorted := make([]flat.Feature, len(encodedFeatures))
+	for index, ref := range refs {
+		sorted[index] = encodedFeatures[ref.Offset]
+	}
+	return sorted
 }
 
 func encodeStreamingFlatGeobuf(input io.Reader, output io.Writer, settings flatEncodeSettings, targetCRS string) error {
@@ -194,7 +225,8 @@ func decodeFlatGeobuf(input io.Reader, output io.Writer, outputMode geodata.Outp
 }
 
 func decodeFlatGeobufWithBBox(input io.Reader, output io.Writer, outputMode geodata.OutputMode, bbox *[4]float64) error {
-	reader := gogamafgb.NewFileReader(struct{ io.Reader }{input})
+	flatInput, seeker, inputOffset := flatGeobufReader(input)
+	reader := gogamafgb.NewFileReader(flatInput)
 	header, err := reader.Header()
 	if err != nil {
 		return fmt.Errorf("input has an invalid FlatGeobuf header: %w", err)
@@ -207,19 +239,78 @@ func decodeFlatGeobufWithBBox(input io.Reader, output io.Writer, outputMode geod
 	if err := writer.Start(); err != nil {
 		return err
 	}
+	var indexedMatches packedrtree.Results
+	if bbox != nil && header.IndexNodeSize() != 0 && header.FeaturesCount() != 0 {
+		searchBoxes, usable := flatIndexSearchBoxes(*bbox, sourceCRS)
+		if usable {
+			if seeker != nil {
+				indexOffset, seekErr := seeker.Seek(0, io.SeekCurrent)
+				if seekErr != nil {
+					err = fmt.Errorf("failed to locate the FlatGeobuf packed index: %w", seekErr)
+				}
+				for _, searchBox := range searchBoxes {
+					if err != nil {
+						break
+					}
+					if _, err = seeker.Seek(indexOffset, io.SeekStart); err == nil {
+						var matches packedrtree.Results
+						matches, err = packedrtree.Seek(seeker, int(header.FeaturesCount()), header.IndexNodeSize(), searchBox)
+						indexedMatches = append(indexedMatches, matches...)
+					}
+				}
+			} else {
+				var index *packedrtree.PackedRTree
+				index, err = reader.Index()
+				if err == nil {
+					for _, searchBox := range searchBoxes {
+						indexedMatches = append(indexedMatches, index.Search(searchBox)...)
+					}
+				}
+			}
+			indexedMatches = uniqueFlatResults(indexedMatches)
+			if err == nil && seeker != nil {
+				_, err = seeker.Seek(inputOffset, io.SeekStart)
+			}
+			if err == nil && seeker != nil {
+				reader = gogamafgb.NewFileReader(seeker)
+				header, err = reader.Header()
+			}
+			if err != nil {
+				return errors.Join(fmt.Errorf("failed to search the FlatGeobuf packed index: %w", err), writer.Close())
+			}
+			sort.Slice(indexedMatches, func(first, second int) bool {
+				return indexedMatches[first].RefIndex < indexedMatches[second].RefIndex
+			})
+			if len(indexedMatches) == 0 {
+				return writer.Close()
+			}
+		}
+	}
 	var decodeErr error
 	featureNumber := 0
+	matchNumber := 0
+	matchedAll := false
 	buffer := make([]flat.Feature, 64)
 	for {
 		count, err := reader.Data(buffer)
 		for index := 0; index < count; index++ {
 			featureNumber++
+			if indexedMatches != nil {
+				if indexedMatches[matchNumber].RefIndex != featureNumber-1 {
+					continue
+				}
+				matchNumber++
+			}
 			if writeErr := writeDecodedFlatFeature(&buffer[index], header, sourceCRS, writer, featureNumber, bbox); writeErr != nil {
 				decodeErr = writeErr
 				break
 			}
+			if indexedMatches != nil && matchNumber == len(indexedMatches) {
+				matchedAll = true
+				break
+			}
 		}
-		if decodeErr != nil || err == io.EOF {
+		if decodeErr != nil || matchedAll || err == io.EOF {
 			break
 		}
 		if err != nil {
@@ -227,7 +318,94 @@ func decodeFlatGeobufWithBBox(input io.Reader, output io.Writer, outputMode geod
 			break
 		}
 	}
+	if decodeErr == nil && indexedMatches != nil && !matchedAll {
+		decodeErr = fmt.Errorf("FlatGeobuf data ended after %d Features before all %d packed-index matches were found", featureNumber, len(indexedMatches))
+	}
 	return errors.Join(decodeErr, writer.Close())
+}
+
+func flatGeobufReader(input io.Reader) (io.Reader, io.ReadSeeker, int64) {
+	seeker, ok := input.(io.ReadSeeker)
+	if !ok {
+		return input, nil, 0
+	}
+	offset, err := seeker.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return struct{ io.Reader }{input}, nil, 0
+	}
+	return input, seeker, offset
+}
+
+func flatIndexSearchBoxes(bbox [4]float64, sourceCRS string) ([]packedrtree.Box, bool) {
+	boxes := [][4]float64{bbox}
+	if bbox[0] > bbox[2] {
+		boxes = [][4]float64{
+			{bbox[0], bbox[1], 180, bbox[3]},
+			{-180, bbox[1], bbox[2], bbox[3]},
+		}
+	}
+	searchBoxes := make([]packedrtree.Box, 0, len(boxes))
+	for _, box := range boxes {
+		searchBox, usable := flatIndexSearchBox(box, sourceCRS)
+		if !usable {
+			return nil, false
+		}
+		searchBoxes = append(searchBoxes, searchBox)
+	}
+	return searchBoxes, true
+}
+
+func flatIndexSearchBox(bbox [4]float64, sourceCRS string) (packedrtree.Box, bool) {
+	const segments = 64
+	coordinates := make([]float64, 0, (segments+1)*8)
+	for segment := 0; segment <= segments; segment++ {
+		fraction := float64(segment) / segments
+		x := bbox[0] + (bbox[2]-bbox[0])*fraction
+		y := bbox[1] + (bbox[3]-bbox[1])*fraction
+		coordinates = append(coordinates,
+			x, bbox[1],
+			bbox[2], y,
+			bbox[2]-(bbox[2]-bbox[0])*fraction, bbox[3],
+			bbox[0], bbox[3]-(bbox[3]-bbox[1])*fraction,
+		)
+	}
+	geometry := geom.NewLineStringFlat(geom.XY, coordinates)
+	if _, err := geodata.TransformGeometry(geometry, geodata.CRSCRS84, sourceCRS); err != nil {
+		return packedrtree.Box{}, false
+	}
+	bounds := geometry.Bounds()
+	xPadding := math.Max(1, bounds.Max(0)-bounds.Min(0)) * 1e-7
+	yPadding := math.Max(1, bounds.Max(1)-bounds.Min(1)) * 1e-7
+	return packedrtree.Box{
+		XMin: bounds.Min(0) - xPadding,
+		YMin: bounds.Min(1) - yPadding,
+		XMax: bounds.Max(0) + xPadding,
+		YMax: bounds.Max(1) + yPadding,
+	}, true
+}
+
+func uniqueFlatResults(results packedrtree.Results) packedrtree.Results {
+	sort.Slice(results, func(first, second int) bool {
+		return results[first].RefIndex < results[second].RefIndex
+	})
+	writeIndex := 0
+	for _, result := range results {
+		if writeIndex == 0 || result.RefIndex != results[writeIndex-1].RefIndex {
+			results[writeIndex] = result
+			writeIndex++
+		}
+	}
+	return results[:writeIndex]
+}
+
+func flatBoundsIntersect(first, second [4]float64) bool {
+	if first[1] > second[3] || first[3] < second[1] {
+		return false
+	}
+	if second[0] > second[2] {
+		return first[2] >= second[0] || first[0] <= second[2]
+	}
+	return first[0] <= second[2] && first[2] >= second[0]
 }
 
 func writeDecodedFlatFeature(encoded *flat.Feature, header *flat.Header, sourceCRS string, writer *geodata.FeatureWriter, featureNumber int, bbox *[4]float64) error {
@@ -239,7 +417,7 @@ func writeDecodedFlatFeature(encoded *flat.Feature, header *flat.Header, sourceC
 	if err != nil {
 		return fmt.Errorf("FlatGeobuf Feature %d failed GeoJSON validation: %w", featureNumber, err)
 	}
-	if bbox != nil && (!summary.HasBounds || summary.Bounds[2] < bbox[0] || summary.Bounds[0] > bbox[2] || summary.Bounds[3] < bbox[1] || summary.Bounds[1] > bbox[3]) {
+	if bbox != nil && (!summary.HasBounds || !flatBoundsIntersect(summary.Bounds, *bbox)) {
 		return nil
 	}
 	return writer.Write(feature)
@@ -261,8 +439,14 @@ func parseFlatBBox(value string) (*[4]float64, error) {
 		}
 		bbox[index] = parsed
 	}
-	if bbox[0] > bbox[2] || bbox[1] > bbox[3] {
-		return nil, fmt.Errorf("FlatGeobuf bbox %v has a minimum greater than its maximum", bbox)
+	if bbox[0] < -180 || bbox[0] > 180 || bbox[2] < -180 || bbox[2] > 180 {
+		return nil, fmt.Errorf("FlatGeobuf bbox %v has longitude outside -180 through 180", bbox)
+	}
+	if bbox[1] < -90 || bbox[1] > 90 || bbox[3] < -90 || bbox[3] > 90 {
+		return nil, fmt.Errorf("FlatGeobuf bbox %v has latitude outside -90 through 90", bbox)
+	}
+	if bbox[1] > bbox[3] {
+		return nil, fmt.Errorf("FlatGeobuf bbox %v has minimum latitude greater than maximum latitude", bbox)
 	}
 	return &bbox, nil
 }
@@ -298,7 +482,7 @@ func main() {
 	indexed := flag.Bool("index", true, "Build a packed spatial index and native property columns while encoding; false streams immediately with exact Features in one JSON column")
 	outputCRS := flag.String("crs", geodata.CRSCRS84, "CRS for encoded FlatGeobuf coordinates; GeoJSON input is reprojected from WGS 84")
 	dimension := flag.Int("dimensions", 2, "Coordinate dimension declared by streaming output when -index=false: 2 or 3; indexed output infers it from the Features")
-	bboxValue := flag.String("bbox", "", "Decode only Features intersecting minLon,minLat,maxLon,maxLat; an indexed input is queried directly and an unindexed input is scanned")
+	bboxValue := flag.String("bbox", "", "Decode only Features intersecting minLon,minLat,maxLon,maxLat; minLon greater than maxLon crosses the antimeridian, indexed input is queried directly, and unindexed input is scanned")
 	runTest := flag.Bool("test", false, "Run an in-memory GeoJSON-to-FlatGeobuf-to-GeoJSON round-trip check and exit")
 	flag.Parse()
 	if flag.NArg() != 0 {

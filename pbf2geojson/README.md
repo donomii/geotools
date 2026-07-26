@@ -1,221 +1,132 @@
+# pbf2json
 
-pbf2json creates a JSON stream of openstreetmap data from any PBF extract, you can pick-and-choose only the bits of the file you want, the library will take care of de-normalizing the relational data (nodes/ways/relations) so you can put it straight in to your favourite document-store, inverted index or graph database.
+`pbf2json` selects tagged OpenStreetMap objects from a local PBF extract and writes valid GeoJSON. It resolves way nodes, assembles supported relations, and emits geometries rather than the normalized node references stored in OSM.
 
-![animated-gif](http://missinglink.embed.s3.amazonaws.com/pbf2json-2.gif)
+The input must be a seekable PBF file because the converter makes multiple streaming passes over it. Standard input is not supported.
 
-### Run from pre-built binary
+## Build
 
-[![Greenkeeper badge](https://badges.greenkeeper.io/pelias/pbf2json.svg)](https://greenkeeper.io/)
+From the repository root:
 
-You don't need to have `Go` installed on your system to use one of the precompiled binaries in `./build`:
-
-```bash
-# AMD 64-bit linux/macOS/windows
-$ ./build/pbf2json.linux-x64
-$ ./build/pbf2json.darwin-x64
-$ ./build/pbf2json.win32-x64
-
-# ARM 64-bit linux/macOS
-$ ./build/pbf2json.linux-arm64
-$ ./build/pbf2json.darwin-arm64
+```sh
+./build_all.sh
 ```
 
-### Usage
+The binary is written to `bin/pbf2json`. To build only this command:
 
-To control which tags are output you must pass the `-tags=` flag to `pbf2json` and the PBF filepath:
-
-```bash
-$ ./build/pbf2json.linux-x64 -tags="amenity" /tmp/wellington_new-zealand.osm.pbf
-```
-```bash
-{"id":170603342,"type":"node","lat":-41.289843000000005,"lon":174.7944402,"tags":{"amenity":"fountain","created_by":"Potlatch 0.5d","name":"Oriental Bay Fountain","source":"knowledge"},"timestamp":"0001-01-01T00:00:00Z"}
-{"id":170605346,"type":"node","lat":-41.2861039,"lon":174.7711539,"tags":{"amenity":"fountain","created_by":"Potlatch 0.10c","source":"knowledge"},"timestamp":"0001-01-01T00:00:00Z"}
+```sh
+mkdir -p bin
+go -C pbf2geojson build -o ../bin/pbf2json .
 ```
 
-### Advanced Usage
+## Usage
 
-Multiple tags can be specified with commas, records will be returned if they match one `OR` the other:
+`-tags` is required:
 
-```bash
-# all buildings and shops
--tags="building,shop"
+```sh
+./bin/pbf2json -tags=amenity wellington.osm.pbf > amenities.geojsonl
 ```
 
-Tags can also be grouped with the `+` symbol, records will only be returned if they match one `AND` the other:
+The default output is one GeoJSON Feature per line:
 
-```bash
-# only records with BOTH housenumber and street specified
--tags="addr:housenumber+addr:street"
+```json
+{"type":"Feature","id":"node/170603342","geometry":{"type":"Point","coordinates":[174.7944402,-41.289843]},"properties":{"osm_type":"node","osm_id":170603342,"tags":{"amenity":"fountain","name":"Oriental Bay Fountain"}}}
 ```
 
-You can also combine the above 2 delimiters to get even more control over what get's returned:
+Use `-strict` to write one GeoJSON FeatureCollection:
 
-```bash
-# only highways and waterways which have a name
--tags="highway+name,waterway+name"
+```sh
+./bin/pbf2json -strict -tags=building,shop city.osm.pbf > selected.geojson
 ```
 
-If you need to target only specific values for a tag you can specify exactly which values you wish to extract using the `~` symbol:
+## Tag expressions
 
-```bash
-# only extract cuisine tags which have the value of vegetarian or vegan
--tags="cuisine~vegetarian,cuisine~vegan"
+Comma-separated groups are alternatives:
+
+```text
+-tags=building,shop
 ```
 
-### Denormalization
+Conditions joined by `+` must all match:
 
-When processing the ways, the node refs are looked up for you and the lat/lon values are added to each way.
-
-Since version `3.0` centroids are also computed for each way, since version `5.0` bounds are now also computed.
-
-Output of the `nodes` array (as seen below) is optional, this was disabled by default in version `5.0` but can be enabled with the flag `--waynodes=true`.
-
-```bash
-{
-  "id": 301435061,
-  "type": "way",
-  "tags": {
-    "addr:housenumber": "33",
-    "addr:postcode": "N5 1TH",
-    "addr:street": "Highbury Park",
-    "building": "residential"
-  },
-  "centroid": {
-    "lat": "51.554679",
-    "lon": "-0.098485"
-  },
-  "bounds": {
-    "e": "-0.0983673",
-    "n": "51.5547179",
-    "s": "51.5546574",
-    "w": "-0.0985915"
-  },
-  "nodes": [
-    {
-      "lat": "51.554663",
-      "lon": "-0.098369"
-    },
-    {
-      "lat": "51.554657",
-      "lon": "-0.098529"
-    },
-    {
-      "lat": "51.554656",
-      "lon": "-0.098592"
-    },
-    {
-      "lat": "51.554676",
-      "lon": "-0.098590"
-    },
-    {
-      "lat": "51.554680",
-      "lon": "-0.098529"
-    },
-    {
-      "lat": "51.554715",
-      "lon": "-0.098529"
-    },
-    {
-      "lat": "51.554720",
-      "lon": "-0.098369"
-    },
-    {
-      "lat": "51.554663",
-      "lon": "-0.098369"
-    }
-  ]
-}
+```text
+-tags=addr:housenumber+addr:street
 ```
 
-### Relations
+The two forms can be combined:
 
-Since version `6.0` centroids and bounding boxes are also computed for relations, the calulations are based off the largest member way by area.
-
-Note: if a `relation` does not contain at least one `way` then it will not be output.
-
-### Leveldb
-
-This library uses `leveldb` to store the lat/lon info about nodes so that it can denormalize the ways for you.
-
-By default the leveldb path is set to `/tmp`, you can change where it stores the data with a flag:
-
-```bash
-$ ./build/pbf2json.linux-x64 -leveldb="/tmp/somewhere"
+```text
+-tags=highway+name,waterway+name
 ```
 
-### Batched writes
+Use `~` to require a specific value:
 
-Since version `3.0` writing of node info to leveldb is done in batches to improve performance.
-
-By default the batch size is `50000`, you can change this with the following flag:
-
-```bash
-$ ./build/pbf2json.linux-x64 -batch="1000"
+```text
+-tags=cuisine~vegetarian,cuisine~vegan
 ```
 
-### NPM module
+## Geometries and properties
 
-```javascript
-var pbf2json = require('pbf2json'),
-    through = require('through2');
+Nodes become Points. Ways become LineStrings or Polygons according to their tags. Multipolygon and boundary relations are assembled from member ways, including nested relations. Polygon rings are normalized to GeoJSON winding order.
 
-var config = {
-  file: '/tmp/wellington_new-zealand.osm.pbf',
-  tags: [
-    'addr:housenumber+addr:street'
-  ],
-  leveldb: '/tmp'
-};
+Every Feature has an ID such as `node/123`, `way/456`, or `relation/789`. Properties contain `osm_type`, numeric `osm_id`, and the original OSM tags. Ways also include a centroid and bounding box. `-waynodes` adds the resolved node latitude/longitude list to way properties.
 
-pbf2json.createReadStream( config )
- .pipe( through.obj( function( item, e, next ){
-    console.log( item );
-    next();
- }));
+Objects required to construct a selected way or relation are retained even when they do not independently match the requested tags.
+
+## Coordinate storage
+
+Coordinates for every node referenced by a selected way or relation, and every way needed by a selected relation, are stored in memory by default; no temporary database is created. Selection masks and selected or nested relations also remain in memory.
+
+For inputs that do not fit comfortably in memory, provide a path for a new disk-backed LevelDB:
+
+```sh
+./bin/pbf2json -tags=building -leveldb=/data/pbf-cache city.osm.pbf > buildings.geojsonl
 ```
 
-### Run the go code from source
+`-batch` controls the number of cached elements per LevelDB write and defaults to 50000. It is ignored when `-leveldb` is empty.
 
-Make sure `Go` is installed and configured on your system, see: https://gist.github.com/missinglink/4212a81a7d9c125b68d9
+## Options
 
-**Note:** You should install the latest version of Golang, at least `1.5+`, last tested on `1.6.2`
+| Option | Meaning |
+| --- | --- |
+| `-tags=EXPRESSION` | Required tag selection expression using comma, `+`, and optional `~value` conditions. |
+| `-strict` | Emit one GeoJSON FeatureCollection instead of GeoJSON Lines. |
+| `-waynodes` | Include resolved way-node coordinates in way properties. |
+| `-leveldb=PATH` | Store referenced-node coordinates and relation-member ways in a new LevelDB directory instead of memory. Selection masks and selected or nested relations remain in memory. |
+| `-batch=50000` | Set elements per disk-backed LevelDB write; ignored for in-memory storage. |
+| `-test` | Run the command's built-in checks and exit. |
 
-```bash
-sudo apt-get install mercurial;
-go get;
-go run pbf2json.go;
+## Node module
+
+The Node wrapper exposes `createReadStream(config)` and decodes the command's GeoJSON Lines into an object stream. Install its dependencies with `npm install`, then place a matching binary at `pbf2geojson/build/pbf2json.<platform>-<architecture>`.
+
+```js
+const pbf2json = require("./index");
+
+pbf2json.createReadStream({
+  file: "/data/city.osm.pbf",
+  tags: ["addr:housenumber+addr:street"],
+  waynodes: false
+}).on("data", feature => {
+  console.log(feature);
+});
 ```
 
-### Compile source for all supported architecture
+The optional `leveldb`, `batch`, and `waynodes` configuration properties map to the corresponding command options.
 
-If you are doing a release and would like to compile for all supported architectures:
+## Tests
 
-**note** if this is your first time doing this please read the notes in './compile.sh' to set it all up on your machine.
+From the repository root:
 
-```bash
-bash compile.sh;
+```sh
+go -C pbf2geojson test ./...
+./bin/pbf2json -test
 ```
 
-### Compile source for a new architecture
+After installing the optional Node dependencies, run the Node assertions with:
 
-If you would like to compile a version of this lib for an architecture which isn't currently supported you can:
-
-```bash
-go get;
-go build;
-chmod +x pbf2json;
-mv pbf2json build/pbf2json.{platform}-{arch};
+```sh
+node pbf2geojson/test/run.js
 ```
 
-Note you will need to change the variables {platform} and {arch} to match those returned by `nodejs` for your system:
-
-```javascript
-$ node
-> var os=require('os')
-> os.platform()
-'linux'
-> os.arch()
-'x64'
-```
-
-Then submit a pull request, you are awesome ;)
+The Node end-to-end suite also requires `pbf2geojson/test/vancouver_canada.osm.pbf` with the hash documented by its pretest script. The suite does not download the fixture.

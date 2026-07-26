@@ -12,7 +12,8 @@ func TestComputeCentroidWithEntranceNode(t *testing.T) {
 		map[string]string{"lat": "1", "lon": "2", "entrance": "1"},
 	}
 
-	var centroid, bounds = computeCentroidAndBounds(latlons)
+	centroid, bounds, err := computeCentroidAndBounds(latlons)
+	assert.NoError(t, err)
 	assert.Equal(t, "1", centroid["lat"])
 	assert.Equal(t, "2", centroid["lon"])
 	assert.Equal(t, +1.0, bounds.North())
@@ -29,7 +30,8 @@ func TestComputeCentroidWithMainEntranceNode(t *testing.T) {
 		map[string]string{"lat": "-1", "lon": "-2", "entrance": "1", "wheelchair": "2"},
 	}
 
-	var centroid, bounds = computeCentroidAndBounds(latlons)
+	centroid, bounds, err := computeCentroidAndBounds(latlons)
+	assert.NoError(t, err)
 	assert.Equal(t, "1", centroid["lat"])
 	assert.Equal(t, "2", centroid["lon"])
 	assert.Equal(t, +1.0, bounds.North())
@@ -45,7 +47,8 @@ func TestComputeCentroidWithAccessibleEntranceNode(t *testing.T) {
 		map[string]string{"lat": "-1", "lon": "-2", "entrance": "1", "wheelchair": "2"},
 	}
 
-	var centroid, bounds = computeCentroidAndBounds(latlons)
+	centroid, bounds, err := computeCentroidAndBounds(latlons)
+	assert.NoError(t, err)
 	assert.Equal(t, "-1", centroid["lat"])
 	assert.Equal(t, "-2", centroid["lon"])
 	assert.Equal(t, +0.0, bounds.North())
@@ -60,7 +63,8 @@ func TestComputeCentroidWithRegularEntranceNode(t *testing.T) {
 		map[string]string{"lat": "0", "lon": "0", "entrance": "1"},
 	}
 
-	var centroid, bounds = computeCentroidAndBounds(latlons)
+	centroid, bounds, err := computeCentroidAndBounds(latlons)
+	assert.NoError(t, err)
 	assert.Equal(t, "0", centroid["lat"])
 	assert.Equal(t, "0", centroid["lon"])
 	assert.Equal(t, +0.0, bounds.North())
@@ -79,7 +83,8 @@ func TestComputeCentroidForClosedPolygon(t *testing.T) {
 		map[string]string{"lat": "1", "lon": "1"},
 	}
 
-	var centroid, bounds = computeCentroidAndBounds(latlons)
+	centroid, bounds, err := computeCentroidAndBounds(latlons)
+	assert.NoError(t, err)
 	assert.Equal(t, "0.0000000", centroid["lat"])
 	assert.Equal(t, "0.0000000", centroid["lon"])
 	assert.Equal(t, +1.0, bounds.North())
@@ -100,7 +105,8 @@ func TestComputeCentroidForHillboroPublicLibrary(t *testing.T) {
 		map[string]string{"lat": "45.5424694", "lon": "-122.9356798"},
 	}
 
-	var centroid, bounds = computeCentroidAndBounds(latlons)
+	centroid, bounds, err := computeCentroidAndBounds(latlons)
+	assert.NoError(t, err)
 	assert.Equal(t, "45.5428760", centroid["lat"])
 	assert.Equal(t, "-122.9359955", centroid["lon"])
 	assert.Equal(t, +45.5433259, bounds.North())
@@ -117,11 +123,26 @@ func TestComputeCentroidForOpenLineString(t *testing.T) {
 		map[string]string{"lat": "-1", "lon": "-1"},
 	}
 
-	var centroid, bounds = computeCentroidAndBounds(latlons)
+	centroid, bounds, err := computeCentroidAndBounds(latlons)
+	assert.NoError(t, err)
 	assert.Equal(t, "0.0000000", centroid["lat"])
 	assert.Equal(t, "0.0000000", centroid["lon"])
 	assert.Equal(t, +1.0, bounds.North())
 	assert.Equal(t, -1.0, bounds.South())
 	assert.Equal(t, +1.0, bounds.East())
 	assert.Equal(t, -1.0, bounds.West())
+}
+
+func TestComputeCentroidRejectsInvalidCachedCoordinates(t *testing.T) {
+	cases := []map[string]string{
+		{"lat": "not-a-number", "lon": "1"},
+		{"lat": "1", "lon": "NaN"},
+		{"lat": "91", "lon": "1"},
+		{"lat": "1", "lon": "181"},
+	}
+	for _, coordinate := range cases {
+		if _, _, err := computeCentroidAndBounds([]map[string]string{coordinate}); err == nil {
+			t.Fatalf("accepted invalid cached coordinate %#v", coordinate)
+		}
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"reflect"
 	"sort"
@@ -45,13 +46,19 @@ func TestFlatGeobufRealDataRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	properties, _, _, err := decodeFlatProperties(encodedFeatures[0].PropertiesBytes(), header)
-	if err != nil {
-		t.Fatal(err)
+	var singaporeProperties map[string]json.RawMessage
+	for index := range encodedFeatures {
+		properties, _, _, err := decodeFlatProperties(encodedFeatures[index].PropertiesBytes(), header)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(properties["name"]) == `"Singapore"` {
+			singaporeProperties = properties
+			break
+		}
 	}
-	if string(properties["name"]) != `"Singapore"` || string(properties["capital"]) != "true" ||
-		string(properties["aliases"]) != `["Singapore", "Singapura"]` {
-		t.Fatalf("native FlatGeobuf properties are %v", properties)
+	if string(singaporeProperties["capital"]) != "true" || string(singaporeProperties["aliases"]) != `["Singapore", "Singapura"]` {
+		t.Fatalf("native FlatGeobuf properties are %v", singaporeProperties)
 	}
 	var output bytes.Buffer
 	if err := decodeFlatGeobuf(&flatData, &output, geodata.OutputCollection); err != nil {
@@ -136,7 +143,7 @@ func TestFlatGeobufBBoxQueryIndexedAndStreaming(t *testing.T) {
 			}
 			bbox := [4]float64{103, 1, 104, 2}
 			var output bytes.Buffer
-			if err := decodeFlatGeobufWithBBox(&encoded, &output, geodata.OutputCollection, &bbox); err != nil {
+			if err := decodeFlatGeobufWithBBox(bytes.NewReader(encoded.Bytes()), &output, geodata.OutputCollection, &bbox); err != nil {
 				t.Fatal(err)
 			}
 			features := sortedFlatFeatures(t, output.Bytes())
@@ -144,6 +151,82 @@ func TestFlatGeobufBBoxQueryIndexedAndStreaming(t *testing.T) {
 				t.Fatalf("bbox query returned %d Features; expected Singapore point and Marina Bay polygon", len(features))
 			}
 		})
+	}
+}
+
+func TestFlatGeobufBBoxQueryUsesProjectedIndex(t *testing.T) {
+	data, err := os.ReadFile("../testdata/real_places.geojson")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	settings := flatEncodeSettings{
+		InputMode: geodata.InputAuto, LayerName: "places", Indexed: true,
+		CRS: geodata.CRSEPSG3857,
+	}
+	if err := encodeFlatGeobufWithSettings(bytes.NewReader(data), &encoded, settings); err != nil {
+		t.Fatal(err)
+	}
+	bbox := [4]float64{103, 1, 104, 2}
+	var output bytes.Buffer
+	if err := decodeFlatGeobufWithBBox(bytes.NewReader(encoded.Bytes()), &output, geodata.OutputCollection, &bbox); err != nil {
+		t.Fatal(err)
+	}
+	features := sortedFlatFeatures(t, output.Bytes())
+	if len(features) != 2 {
+		t.Fatalf("projected bbox query returned %d Features; expected Singapore point and Marina Bay polygon", len(features))
+	}
+}
+
+func TestFlatGeobufBBoxQueryCrossesAntimeridian(t *testing.T) {
+	input := []byte(`{"type":"FeatureCollection","features":[
+		{"type":"Feature","geometry":{"type":"Point","coordinates":[175,1]},"properties":{"name":"east"}},
+		{"type":"Feature","geometry":{"type":"Point","coordinates":[-175,1]},"properties":{"name":"west"}},
+		{"type":"Feature","geometry":{"type":"Point","coordinates":[0,1]},"properties":{"name":"middle"}}
+	]}`)
+	tests := []struct {
+		name      string
+		indexed   bool
+		seekable  bool
+		sourceCRS string
+	}{
+		{name: "indexed seekable", indexed: true, seekable: true, sourceCRS: geodata.CRSCRS84},
+		{name: "indexed stream", indexed: true, seekable: false, sourceCRS: geodata.CRSCRS84},
+		{name: "indexed projected", indexed: true, seekable: true, sourceCRS: geodata.CRSEPSG3857},
+		{name: "unindexed", indexed: false, seekable: false, sourceCRS: geodata.CRSCRS84},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var encoded bytes.Buffer
+			settings := flatEncodeSettings{
+				InputMode: geodata.InputAuto, LayerName: "places", Indexed: test.indexed,
+				CRS: test.sourceCRS, Dimension: 2,
+			}
+			if err := encodeFlatGeobufWithSettings(bytes.NewReader(input), &encoded, settings); err != nil {
+				t.Fatal(err)
+			}
+			var reader io.Reader = bytes.NewReader(encoded.Bytes())
+			if !test.seekable {
+				reader = struct{ io.Reader }{reader}
+			}
+			bbox := [4]float64{170, -10, -170, 10}
+			var output bytes.Buffer
+			if err := decodeFlatGeobufWithBBox(reader, &output, geodata.OutputCollection, &bbox); err != nil {
+				t.Fatal(err)
+			}
+			features := sortedFlatFeatures(t, output.Bytes())
+			if len(features) != 2 {
+				t.Fatalf("antimeridian bbox query returned %d Features; expected east and west", len(features))
+			}
+		})
+	}
+}
+
+func TestParseFlatBBoxRejectsCoordinatesOutsideWGS84(t *testing.T) {
+	for _, value := range []string{"-181,0,1,1", "0,-91,1,1", "0,0,181,1", "0,0,1,91"} {
+		if _, err := parseFlatBBox(value); err == nil {
+			t.Fatalf("accepted bbox %q outside WGS84", value)
+		}
 	}
 }
 

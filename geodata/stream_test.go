@@ -82,6 +82,20 @@ func TestSequenceRejectsMultipleValuesInOneRecord(t *testing.T) {
 	}
 }
 
+func TestSequenceRejectsMissingLineFeedsAndEmptyRecords(t *testing.T) {
+	feature := `{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`
+	for _, input := range []string{
+		"\x1e" + feature,
+		"\x1e\n",
+		"\x1e" + feature + "\n\x1e",
+		"\x1e" + feature + "\x1e" + feature + "\n",
+	} {
+		if err := ReadFeatures(strings.NewReader(input), InputSequence, func(feature Feature) error { return nil }); err == nil {
+			t.Fatalf("accepted invalid GeoJSON sequence %q", input)
+		}
+	}
+}
+
 func TestAutoDetectsSequenceAfterLeadingWhitespace(t *testing.T) {
 	input := " \n\t\x1e" + `{"type":"Feature","id":"one","geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}` + "\n"
 	features := readFeaturesForTest(t, []byte(input), InputAuto)
@@ -154,6 +168,32 @@ func TestFeatureCollectionMayPutTypeAfterFeatures(t *testing.T) {
 	features := readFeaturesForTest(t, input, InputAuto)
 	if len(features) != 1 {
 		t.Fatalf("out-of-order FeatureCollection returned %d Features; expected 1", len(features))
+	}
+}
+
+func TestReadFeaturesRejectsDuplicateObjectMembers(t *testing.T) {
+	cases := []string{
+		`{"type":"Feature","type":"Feature","geometry":{"type":"Point","coordinates":[0,0]},"properties":{}}`,
+		`{"type":"Feature","geometry":{"type":"Point","coordinates":[0,0],"coordinates":[1,1]},"properties":{}}`,
+		`{"type":"Feature","geometry":{"type":"Point","coordinates":[0,0]},"properties":{"name":"first","name":"second"}}`,
+		`{"type":"FeatureCollection","features":[],"features":[]}`,
+		`{"type":"FeatureCollection","metadata":{"source":"first","source":"second"},"features":[]}`,
+	}
+	for _, input := range cases {
+		if err := ReadFeatures(strings.NewReader(input), InputAuto, func(feature Feature) error { return nil }); err == nil {
+			t.Fatalf("accepted duplicate object member in %s", input)
+		}
+	}
+}
+
+func TestStreamingAPIsRejectInvalidModes(t *testing.T) {
+	input := strings.NewReader(`{"type":"Feature","geometry":{"type":"Point","coordinates":[0,0]},"properties":{}}`)
+	if err := ReadFeatures(input, InputMode("invalid"), func(feature Feature) error { return nil }); err == nil {
+		t.Fatal("ReadFeatures accepted an invalid input mode")
+	}
+	writer := NewFeatureWriter(&bytes.Buffer{}, OutputMode("invalid"))
+	if err := writer.Start(); err == nil {
+		t.Fatal("FeatureWriter accepted an invalid output mode")
 	}
 }
 

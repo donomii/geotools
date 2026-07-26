@@ -2,10 +2,12 @@ package geodata
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 
 	"github.com/paulmach/orb"
@@ -122,8 +124,12 @@ func EncodeMVT(input io.Reader, output io.Writer, inputMode InputMode, settings 
 	if err != nil {
 		return fmt.Errorf("failed to encode tile %d/%d/%d: %w", settings.Zoom, settings.X, settings.Y, err)
 	}
-	if _, err := output.Write(encoded); err != nil {
+	written, err := output.Write(encoded)
+	if err != nil {
 		return fmt.Errorf("failed to write tile %d/%d/%d: %w", settings.Zoom, settings.X, settings.Y, err)
+	}
+	if written != len(encoded) {
+		return fmt.Errorf("failed to write tile %d/%d/%d: wrote %d of %d bytes: %w", settings.Zoom, settings.X, settings.Y, written, len(encoded), io.ErrShortWrite)
 	}
 	return nil
 }
@@ -146,7 +152,11 @@ func preserveMVTFeatureID(feature *Feature, propertyName string, featureNumber i
 	if err != nil {
 		return err
 	}
-	return feature.SetPropertyMap(properties)
+	if err := feature.SetPropertyMap(properties); err != nil {
+		return err
+	}
+	feature.ID = nil
+	return nil
 }
 
 func normalizeMVTPolygonWinding(geometry orb.Geometry) {
@@ -183,16 +193,18 @@ func DecodeMVT(input io.Reader, output io.Writer, outputMode OutputMode, setting
 	if settings.AllLayers && settings.IDProperty != "" && settings.IDProperty == settings.LayerProperty {
 		return fmt.Errorf("MVT id property %q is also the decoded layer-name property; use distinct property names", settings.IDProperty)
 	}
-	data, err := io.ReadAll(input)
+	maxInputBytes := settings.MaxInputBytes
+	if maxInputBytes == 0 {
+		maxInputBytes = DefaultMVTMaxInputBytes
+	}
+	if maxInputBytes < 0 {
+		return fmt.Errorf("MVT maximum decoded input size %d is negative; expected zero for the %d-byte default or a positive byte count", settings.MaxInputBytes, DefaultMVTMaxInputBytes)
+	}
+	data, err := readMVTData(input, settings.Gzip, maxInputBytes)
 	if err != nil {
 		return fmt.Errorf("failed to read MVT tile %d/%d/%d: %w", settings.Zoom, settings.X, settings.Y, err)
 	}
-	var layers mvt.Layers
-	if settings.Gzip {
-		layers, err = mvt.UnmarshalGzipped(data)
-	} else {
-		layers, err = mvt.Unmarshal(data)
-	}
+	layers, err := mvt.Unmarshal(data)
 	if err != nil {
 		return fmt.Errorf("failed to decode MVT tile %d/%d/%d: %w", settings.Zoom, settings.X, settings.Y, err)
 	}
@@ -266,6 +278,39 @@ func DecodeMVT(input io.Reader, output io.Writer, outputMode OutputMode, setting
 		}
 	}
 	return errors.Join(decodeErr, writer.Close())
+}
+
+func readMVTData(input io.Reader, gzipInput bool, maxInputBytes int64) ([]byte, error) {
+	source := input
+	var gzipReader *gzip.Reader
+	if gzipInput {
+		var err error
+		gzipReader, err = gzip.NewReader(input)
+		if err != nil {
+			return nil, fmt.Errorf("gzip header is invalid: %w", err)
+		}
+		source = gzipReader
+	}
+	readLimit := maxInputBytes
+	if readLimit < math.MaxInt64 {
+		readLimit++
+	}
+	data, err := io.ReadAll(io.LimitReader(source, readLimit))
+	if err != nil {
+		if gzipInput {
+			return nil, fmt.Errorf("gzip-compressed input cannot be decompressed: %w", err)
+		}
+		return nil, err
+	}
+	if int64(len(data)) > maxInputBytes {
+		return nil, fmt.Errorf("decoded input is at least %d bytes; configured maximum is %d bytes", len(data), maxInputBytes)
+	}
+	if gzipReader != nil {
+		if err := gzipReader.Close(); err != nil {
+			return nil, fmt.Errorf("failed to finish reading gzip-compressed input: %w", err)
+		}
+	}
+	return data, nil
 }
 
 func restoreMVTFeatureID(feature *Feature, propertyName, layerName string, featureNumber int) error {

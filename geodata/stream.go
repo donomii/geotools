@@ -46,8 +46,12 @@ func ParseOutputMode(value string) (OutputMode, error) {
 
 func ReadFeatures(input io.Reader, mode InputMode, visit FeatureVisitor) error {
 	reader := bufio.NewReader(input)
-	if mode == InputSequence {
+	switch mode {
+	case InputSequence:
 		return readSequence(reader, visit)
+	case InputAuto:
+	default:
+		return fmt.Errorf("invalid input mode %q; expected auto or seq", mode)
 	}
 	first, err := discardLeadingWhitespace(reader)
 	if err == io.EOF {
@@ -87,30 +91,29 @@ func readSequence(reader *bufio.Reader, visit FeatureVisitor) error {
 	if first != 0x1e {
 		return fmt.Errorf("GeoJSON sequence starts with byte 0x%02x; expected record separator 0x1e", first)
 	}
-	recordNumber := 0
-	var record bytes.Buffer
+	recordNumber := 1
 	for {
 		part, readErr := reader.ReadBytes(0x1e)
-		if len(part) > 0 {
-			if part[len(part)-1] == 0x1e {
-				part = part[:len(part)-1]
-			}
-			record.Write(part)
+		if len(part) > 0 && part[len(part)-1] == 0x1e {
+			part = part[:len(part)-1]
 		}
-		trimmed := bytes.TrimSpace(record.Bytes())
-		if len(trimmed) > 0 {
-			recordNumber++
-			if err := readJSONValuesLimited(bytes.NewReader(trimmed), 1, visit); err != nil {
-				return fmt.Errorf("GeoJSON sequence record %d is invalid: %w", recordNumber, err)
-			}
+		if len(part) == 0 || part[len(part)-1] != '\n' {
+			return fmt.Errorf("GeoJSON sequence record %d is not followed by the required line feed", recordNumber)
 		}
-		record.Reset()
+		trimmed := bytes.TrimSpace(part[:len(part)-1])
+		if len(trimmed) == 0 {
+			return fmt.Errorf("GeoJSON sequence record %d is empty", recordNumber)
+		}
+		if err := readJSONValuesLimited(bytes.NewReader(trimmed), 1, visit); err != nil {
+			return fmt.Errorf("GeoJSON sequence record %d is invalid: %w", recordNumber, err)
+		}
 		if readErr == io.EOF {
 			return nil
 		}
 		if readErr != nil {
-			return fmt.Errorf("failed to read GeoJSON sequence record %d: %w", recordNumber+1, readErr)
+			return fmt.Errorf("failed to read GeoJSON sequence record %d: %w", recordNumber, readErr)
 		}
+		recordNumber++
 	}
 }
 
@@ -175,6 +178,7 @@ func visitJSONToken(decoder *json.Decoder, token json.Token, visit FeatureVisito
 
 func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor) error {
 	members := make(map[string]json.RawMessage)
+	seen := make(map[string]bool)
 	featuresSeen := false
 	featuresStreamed := false
 	var deferredFeatures json.RawMessage
@@ -187,6 +191,10 @@ func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor) error {
 		if !ok {
 			return fmt.Errorf("GeoJSON object key has type %T; expected string", keyToken)
 		}
+		if seen[key] {
+			return fmt.Errorf("GeoJSON object contains duplicate member %q", key)
+		}
+		seen[key] = true
 		if key == "features" && rawObjectType(members["type"]) == "FeatureCollection" {
 			featuresSeen = true
 			featuresStreamed = true
@@ -197,6 +205,9 @@ func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor) error {
 			var value json.RawMessage
 			if err := decoder.Decode(&value); err != nil {
 				return fmt.Errorf("failed to decode GeoJSON member %q: %w", key, err)
+			}
+			if err := validateUniqueJSONMembers(value); err != nil {
+				return fmt.Errorf("GeoJSON member %q is invalid: %w", key, err)
 			}
 			if key == "features" {
 				featuresSeen = true
@@ -226,7 +237,7 @@ func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor) error {
 			return fmt.Errorf("FeatureCollection is missing features")
 		}
 		if bbox := members["bbox"]; bbox != nil {
-			if _, err := validateBBox(bbox); err != nil {
+			if _, _, err := validateBBox(bbox); err != nil {
 				return fmt.Errorf("FeatureCollection bbox is invalid: %w", err)
 			}
 		}
@@ -314,11 +325,15 @@ func NewFeatureWriter(output io.Writer, mode OutputMode) *FeatureWriter {
 }
 
 func (writer *FeatureWriter) Start() error {
-	if writer.mode == OutputCollection {
+	switch writer.mode {
+	case OutputCollection:
 		_, err := writer.writer.WriteString(`{"type":"FeatureCollection","features":[`)
 		return err
+	case OutputJSONL, OutputSequence:
+		return nil
+	default:
+		return fmt.Errorf("invalid output mode %q; expected jsonl, collection, or seq", writer.mode)
 	}
-	return nil
 }
 
 func (writer *FeatureWriter) Write(feature Feature) error {

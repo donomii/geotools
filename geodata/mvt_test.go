@@ -2,7 +2,11 @@ package geodata
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 )
@@ -10,7 +14,8 @@ import (
 func TestMVTRoundTripPreservesExactStringAndNumericIDs(t *testing.T) {
 	input := []byte(`{"type":"FeatureCollection","features":[
 		{"type":"Feature","id":"Q334","geometry":{"type":"Point","coordinates":[-20,10]},"properties":{"name":"string"}},
-		{"type":"Feature","id":-7.5,"geometry":{"type":"Point","coordinates":[20,-10]},"properties":{"name":"number"}}
+		{"type":"Feature","id":-7.5,"geometry":{"type":"Point","coordinates":[20,-10]},"properties":{"name":"number"}},
+		{"type":"Feature","id":1e400,"geometry":{"type":"Point","coordinates":[0,0]},"properties":{"name":"large number"}}
 	]}`)
 	output := roundTripMVTForTest(t, input)
 	ids := make(map[string]bool)
@@ -27,7 +32,7 @@ func TestMVTRoundTripPreservesExactStringAndNumericIDs(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !ids[`"Q334"`] || !ids["-7.5"] || len(ids) != 2 {
+	if !ids[`"Q334"`] || !ids["-7.5"] || !ids["1e400"] || len(ids) != 3 {
 		t.Fatalf("decoded ids are %v", ids)
 	}
 }
@@ -151,6 +156,53 @@ func TestMVTRejectsUnsupportedCoordinatesAndGeometry(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMVTDecodeRejectsInputAboveConfiguredLimit(t *testing.T) {
+	var tile bytes.Buffer
+	input := strings.NewReader(`{"type":"Feature","geometry":{"type":"Point","coordinates":[0,0]},"properties":{}}`)
+	if err := EncodeMVT(input, &tile, InputAuto, defaultMVTEncodeSettingsForTest()); err != nil {
+		t.Fatal(err)
+	}
+	for _, gzipInput := range []bool{false, true} {
+		t.Run(map[bool]string{false: "plain", true: "gzip"}[gzipInput], func(t *testing.T) {
+			data := tile.Bytes()
+			if gzipInput {
+				var compressed bytes.Buffer
+				writer := gzip.NewWriter(&compressed)
+				if _, err := writer.Write(data); err != nil {
+					t.Fatal(err)
+				}
+				if err := writer.Close(); err != nil {
+					t.Fatal(err)
+				}
+				data = compressed.Bytes()
+			}
+			settings := defaultMVTDecodeSettingsForTest()
+			settings.Gzip = gzipInput
+			settings.MaxInputBytes = int64(tile.Len() - 1)
+			err := DecodeMVT(bytes.NewReader(data), &bytes.Buffer{}, OutputCollection, settings)
+			if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("configured maximum is %d bytes", settings.MaxInputBytes)) {
+				t.Fatalf("oversized decoded tile produced error %q", err)
+			}
+		})
+	}
+}
+
+func TestMVTEncodeRejectsShortOutputWrite(t *testing.T) {
+	input := strings.NewReader(`{"type":"Feature","geometry":{"type":"Point","coordinates":[0,0]},"properties":{}}`)
+	if err := EncodeMVT(input, shortMVTWriter{}, InputAuto, defaultMVTEncodeSettingsForTest()); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("short MVT output write produced error %v", err)
+	}
+}
+
+type shortMVTWriter struct{}
+
+func (shortMVTWriter) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	return len(data) - 1, nil
 }
 
 func roundTripMVTForTest(t *testing.T, input []byte) []byte {

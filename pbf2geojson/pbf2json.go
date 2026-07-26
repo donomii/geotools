@@ -5,13 +5,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -19,8 +19,6 @@ import (
 	geo "github.com/paulmach/go.geo"
 	"github.com/qedus/osmpbf"
 	"github.com/qedus/osmpbf/OSMPBF"
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/opt"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -37,9 +35,9 @@ type settings struct {
 func getSettings() settings {
 
 	// command line flags
-	leveldbPath := flag.String("leveldb", "", "path to a new LevelDB directory; empty uses an isolated temporary directory")
+	leveldbPath := flag.String("leveldb", "", "optional path to a new LevelDB directory for disk-backed coordinate storage; empty stores selected nodes and ways in memory")
 	tagList := flag.String("tags", "", "comma-separated list of valid tags, group AND conditions with a +")
-	batchSize := flag.Int("batch", 50000, "batch leveldb writes in batches of this size")
+	batchSize := flag.Int("batch", 50000, "number of cached elements per disk-backed LevelDB write; ignored when -leveldb is empty")
 	wayNodes := flag.Bool("waynodes", false, "should the lat/lons of nodes belonging to ways be printed")
 	strict := flag.Bool("strict", false, "emit one GeoJSON FeatureCollection instead of one Feature per line")
 	runBuiltInTests := flag.Bool("test", false, "run built-in tests and exit")
@@ -76,14 +74,6 @@ func getSettings() settings {
 		conditions[group] = strings.Split(group, "+")
 	}
 
-	if *leveldbPath == "" {
-		tempRoot, err := os.MkdirTemp("", "pbf2geojson-leveldb-")
-		if err != nil {
-			log.Fatalf("failed to create temporary LevelDB directory: %v", err)
-		}
-		*leveldbPath = filepath.Join(tempRoot, "db")
-	}
-
 	return settings{
 		PbfPath:    args[0],
 		LevedbPath: *leveldbPath,
@@ -95,8 +85,6 @@ func getSettings() settings {
 }
 
 func main() {
-
-	// configuration
 	config := getSettings()
 	if config.RunBuiltInTests {
 		if err := runBuiltInTests(); err != nil {
@@ -105,12 +93,27 @@ func main() {
 		fmt.Println("pbf2geojson built-in tests passed")
 		return
 	}
-	// open pbf file
-	file := openFile(config.PbfPath)
-	if err := validatePBFFraming(file); err != nil {
-		log.Fatalf("invalid PBF file %q: %v", config.PbfPath, err)
+	if err := convertPBF(config, os.Stdout); err != nil {
+		log.Fatal(err)
 	}
-	rewind(file)
+}
+
+func convertPBF(config settings, output io.Writer) (result error) {
+	file, err := openFile(config.PbfPath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			result = errors.Join(result, fmt.Errorf("failed to close PBF file %q: %w", config.PbfPath, err))
+		}
+	}()
+	if err := validatePBFFraming(file); err != nil {
+		return fmt.Errorf("invalid PBF file %q: %w", config.PbfPath, err)
+	}
+	if err := rewind(file); err != nil {
+		return err
+	}
 
 	// perform two passes over the file, on the first pass
 	// we record a bitmask of the interesting elements in the
@@ -119,33 +122,40 @@ func main() {
 	// set up bimasks
 	var masks = NewBitmaskMap()
 
-	// set up leveldb connection
-	var db = openLevelDB(config.LevedbPath)
+	cache, err := openPBFFeatureCache(config.LevedbPath, config.BatchSize)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, cache.Close())
+	}()
 
 	// === first pass (indexing) ===
 	idxDecoder := osmpbf.NewDecoder(file)
-	err := idxDecoder.Start(runtime.GOMAXPROCS(-1)) // use several goroutines for faster decoding
+	err = idxDecoder.Start(runtime.GOMAXPROCS(-1)) // use several goroutines for faster decoding
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("failed to start PBF decoder for indexing pass: %w", err)
 	}
 
 	// index target IDs in bitmasks
 	if err := index(idxDecoder, masks, config); err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	// Expand nested relations and index the nodes used by their member ways.
 	if !masks.RelWays.Empty() || !masks.RelRelation.Empty() {
 		for {
 			relationCount := masks.RelRelation.Len()
-			rewind(file)
+			if err := rewind(file); err != nil {
+				return err
+			}
 			idxRelationsDecoder := osmpbf.NewDecoder(file)
 			err = idxRelationsDecoder.Start(runtime.GOMAXPROCS(-1)) // use several goroutines for faster decoding
 			if err != nil {
-				log.Fatal(err)
+				return fmt.Errorf("failed to start PBF decoder for relation indexing pass: %w", err)
 			}
 			if err := indexRelationMembers(idxRelationsDecoder, masks, config); err != nil {
-				log.Fatal(err)
+				return err
 			}
 			if masks.RelRelation.Len() == relationCount {
 				break
@@ -154,29 +164,20 @@ func main() {
 	}
 
 	// === final pass (printing json) ===
-	rewind(file)
+	if err := rewind(file); err != nil {
+		return err
+	}
 	decoder := osmpbf.NewDecoder(file)
 	err = decoder.Start(runtime.GOMAXPROCS(-1)) // use several goroutines for faster decoding
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("failed to start PBF decoder for output pass: %w", err)
 	}
 
-	writer := newFeatureWriter(os.Stdout, config.Strict)
+	writer := newFeatureWriter(output, config.Strict)
 	if err := writer.Start(); err != nil {
-		log.Fatal(err)
+		return err
 	}
-	if err := print(decoder, masks, db, config, writer); err != nil {
-		log.Fatal(err)
-	}
-	if err := writer.Close(); err != nil {
-		log.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		log.Fatalf("failed to close LevelDB %q: %v", config.LevedbPath, err)
-	}
-	if err := file.Close(); err != nil {
-		log.Fatalf("failed to close PBF file %q: %v", config.PbfPath, err)
-	}
+	return errors.Join(print(decoder, masks, cache, config, writer), writer.Close())
 }
 
 func validatePBFFraming(input io.Reader) error {
@@ -214,10 +215,11 @@ func validatePBFFraming(input io.Reader) error {
 	}
 }
 
-func rewind(file *os.File) {
+func rewind(file *os.File) error {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		log.Fatalf("failed to rewind PBF file %q: %v", file.Name(), err)
+		return fmt.Errorf("failed to rewind PBF file %q: %w", file.Name(), err)
 	}
+	return nil
 }
 
 func index(d *osmpbf.Decoder, masks *BitmaskMap, config settings) error {
@@ -225,7 +227,7 @@ func index(d *osmpbf.Decoder, masks *BitmaskMap, config settings) error {
 		if v, err := d.Decode(); err == io.EOF {
 			break
 		} else if err != nil {
-			return fmt.Errorf("failed to decode PBF during output pass: %w", err)
+			return fmt.Errorf("failed to decode PBF during indexing pass: %w", err)
 		} else {
 			switch v := v.(type) {
 
@@ -290,9 +292,7 @@ func indexRelation(relation *osmpbf.Relation, masks *BitmaskMap) {
 	}
 }
 
-func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings, writer *featureWriter) error {
-
-	batch := new(leveldb.Batch)
+func print(d *osmpbf.Decoder, masks *BitmaskMap, cache pbfFeatureCache, config settings, writer *featureWriter) error {
 	finishedNodes := false
 	finishedWays := false
 	relations := make(map[int64]*osmpbf.Relation)
@@ -309,15 +309,12 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 			case *osmpbf.Node:
 
 				// ----------------
-				// write to leveldb
+				// cache coordinates
 				// note: only write way refs and relation member nodes
 				// ----------------
 				if masks.WayRefs.Has(v.ID) || masks.RelNodes.Has(v.ID) {
-
-					// write in batches
-					cacheQueueNode(batch, v)
-					if batch.Len() >= config.BatchSize {
-						cacheFlush(db, batch, true)
+					if err := cache.PutNode(v); err != nil {
+						return fmt.Errorf("failed to cache node %d coordinates: %w", v.ID, err)
 					}
 				}
 
@@ -339,27 +336,23 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 			case *osmpbf.Way:
 
 				// ----------------
-				// write to leveldb
-				// flush outstanding node batches
+				// flush outstanding node writes
 				// before processing any ways
 				// ----------------
 				if !finishedNodes {
 					finishedNodes = true
-					if batch.Len() > 0 {
-						cacheFlush(db, batch, true)
+					if err := cache.Flush(); err != nil {
+						return fmt.Errorf("failed to finish caching PBF nodes before way %d: %w", v.ID, err)
 					}
 				}
 
 				// ----------------
-				// write to leveldb
+				// cache member ways
 				// note: only write relation member ways
 				// ----------------
 				if masks.RelWays.Has(v.ID) {
-
-					// write in batches
-					cacheQueueWay(batch, v)
-					if batch.Len() >= config.BatchSize {
-						cacheFlush(db, batch, true)
+					if err := cache.PutWay(v); err != nil {
+						return fmt.Errorf("failed to cache relation member way %d: %w", v.ID, err)
 					}
 				}
 
@@ -367,8 +360,7 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 				// if so, print it
 				if masks.Ways.Has(v.ID) {
 
-					// lookup from leveldb
-					latlons, err := cacheLookupNodes(db, v)
+					latlons, err := cache.LookupNodes(v)
 
 					// skip ways which fail to denormalize
 					if err != nil {
@@ -379,7 +371,10 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 					}
 
 					// compute centroid
-					centroid, bounds := computeCentroidAndBounds(latlons)
+					centroid, bounds, err := computeCentroidAndBounds(latlons)
+					if err != nil {
+						return fmt.Errorf("failed to compute way %d centroid and bounds: %w", v.ID, err)
+					}
 
 					// trim tags
 					v.Tags = trimTags(v.Tags)
@@ -396,14 +391,13 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 			case *osmpbf.Relation:
 
 				// ----------------
-				// write to leveldb
-				// flush outstanding way batches
+				// flush outstanding way writes
 				// before processing any relation
 				// ----------------
 				if !finishedWays {
 					finishedWays = true
-					if batch.Len() > 0 {
-						cacheFlush(db, batch, true)
+					if err := cache.Flush(); err != nil {
+						return fmt.Errorf("failed to finish caching PBF ways before relation %d: %w", v.ID, err)
 					}
 				}
 
@@ -421,11 +415,11 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 			}
 		}
 	}
-	if batch.Len() > 0 {
-		cacheFlush(db, batch, true)
+	if err := cache.Flush(); err != nil {
+		return fmt.Errorf("failed to finish caching PBF elements: %w", err)
 	}
 	for _, relationID := range selectedRelationIDs {
-		feature, err := newRelationFeature(db, relations[relationID], relations)
+		feature, err := newRelationFeature(cache, relations[relationID], relations)
 		if err != nil {
 			return err
 		}
@@ -508,6 +502,9 @@ func (writer *featureWriter) Close() error {
 }
 
 func newNodeFeature(node *osmpbf.Node) (geoJSONFeature, error) {
+	if err := validatePBFCoordinate(node.Lon, node.Lat, fmt.Sprintf("node %d", node.ID)); err != nil {
+		return geoJSONFeature{}, err
+	}
 	coordinates, err := json.Marshal([]float64{node.Lon, node.Lat})
 	if err != nil {
 		return geoJSONFeature{}, fmt.Errorf("failed to encode node %d coordinates: %w", node.ID, err)
@@ -529,7 +526,7 @@ func newWayFeature(way *osmpbf.Way, latlons []map[string]string, centroid map[st
 	if err != nil {
 		return geoJSONFeature{}, fmt.Errorf("failed to build way %d geometry: %w", way.ID, err)
 	}
-	geometry, err := geometryFromCoordinates(coordinates)
+	geometry, err := geometryFromCoordinates(coordinates, way.Tags)
 	if err != nil {
 		return geoJSONFeature{}, fmt.Errorf("failed to build way %d geometry: %w", way.ID, err)
 	}
@@ -560,21 +557,78 @@ func coordinatesFromLatLons(latlons []map[string]string) ([][]float64, error) {
 		if err != nil {
 			return nil, fmt.Errorf("coordinate %d has invalid latitude %q: %w", index, latlon["lat"], err)
 		}
+		if err := validatePBFCoordinate(lon, lat, fmt.Sprintf("coordinate %d", index)); err != nil {
+			return nil, err
+		}
 		coordinates = append(coordinates, []float64{lon, lat})
 	}
 	return coordinates, nil
 }
 
-func geometryFromCoordinates(coordinates [][]float64) (geoJSONGeometry, error) {
+func validatePBFCoordinate(longitude, latitude float64, description string) error {
+	if math.IsNaN(longitude) || math.IsInf(longitude, 0) || longitude < -180 || longitude > 180 {
+		return fmt.Errorf("%s longitude %v is outside -180 through 180", description, longitude)
+	}
+	if math.IsNaN(latitude) || math.IsInf(latitude, 0) || latitude < -90 || latitude > 90 {
+		return fmt.Errorf("%s latitude %v is outside -90 through 90", description, latitude)
+	}
+	return nil
+}
+
+func geometryFromCoordinates(coordinates [][]float64, tags map[string]string) (geoJSONGeometry, error) {
+	if len(coordinates) < 2 {
+		return geoJSONGeometry{}, fmt.Errorf("expected at least two coordinates, received %d", len(coordinates))
+	}
 	geometryType := "LineString"
 	geometryCoordinates := coordinates
-	if len(coordinates) >= 4 && positionsEqual(coordinates[0], coordinates[len(coordinates)-1]) {
+	if len(coordinates) >= 4 && positionsEqual(coordinates[0], coordinates[len(coordinates)-1]) && osmWayIsArea(tags) {
 		geometryType = "Polygon"
-		encoded, err := json.Marshal([][][]float64{coordinates})
+		encoded, err := json.Marshal([][][]float64{normalizeRing(coordinates, false)})
 		return geoJSONGeometry{Type: geometryType, Coordinates: encoded}, err
 	}
 	encoded, err := json.Marshal(geometryCoordinates)
 	return geoJSONGeometry{Type: geometryType, Coordinates: encoded}, err
+}
+
+func osmWayIsArea(tags map[string]string) bool {
+	if area, exists := tags["area"]; exists {
+		return area != "no" && area != "false" && area != "0"
+	}
+	for key, value := range tags {
+		switch key {
+		case "aeroway", "amenity", "area:highway", "building", "building:part", "craft", "geological", "historic",
+			"indoor", "landuse", "leisure", "military", "office", "place", "public_transport", "shop", "sport",
+			"tourism", "water", "wetland":
+			if value != "" && value != "no" {
+				return true
+			}
+		}
+	}
+	if natural := tags["natural"]; natural != "" && natural != "no" {
+		return natural != "coastline" && natural != "cliff" && natural != "ridge" && natural != "tree_row"
+	}
+	if manMade := tags["man_made"]; manMade != "" && manMade != "no" {
+		return manMade != "cutline" && manMade != "embankment" && manMade != "pipeline"
+	}
+	if power := tags["power"]; power != "" && power != "no" {
+		return power != "line" && power != "minor_line" && power != "cable"
+	}
+	return false
+}
+
+func ringSignedArea(ring [][]float64) float64 {
+	area := 0.0
+	for index := 0; index+1 < len(ring); index++ {
+		area += ring[index][0]*ring[index+1][1] - ring[index+1][0]*ring[index][1]
+	}
+	return area / 2
+}
+
+func normalizeRing(ring [][]float64, clockwise bool) [][]float64 {
+	if (ringSignedArea(ring) < 0) == clockwise {
+		return ring
+	}
+	return reverseCoordinates(ring)
 }
 
 func geoJSONBbox(bounds *geo.Bound) []float64 {
@@ -590,7 +644,7 @@ type relationWay struct {
 	Coordinates [][]float64
 }
 
-func newRelationFeature(db *leveldb.DB, relation *osmpbf.Relation, relations map[int64]*osmpbf.Relation) (geoJSONFeature, error) {
+func newRelationFeature(cache pbfFeatureCache, relation *osmpbf.Relation, relations map[int64]*osmpbf.Relation) (geoJSONFeature, error) {
 	if relation == nil {
 		return geoJSONFeature{}, fmt.Errorf("selected relation was not present in the output pass")
 	}
@@ -600,7 +654,7 @@ func newRelationFeature(db *leveldb.DB, relation *osmpbf.Relation, relations map
 		return geoJSONFeature{}, fmt.Errorf("failed to expand relation %d: %w", relation.ID, err)
 	}
 	for index := range ways {
-		latlons, err := cacheLookupWayNodes(db, ways[index].WayID)
+		latlons, err := cache.LookupWayNodes(ways[index].WayID)
 		if err != nil {
 			return geoJSONFeature{}, fmt.Errorf("failed to denormalize relation %d member way %d: %w", relation.ID, ways[index].WayID, err)
 		}
@@ -616,15 +670,19 @@ func newRelationFeature(db *leveldb.DB, relation *osmpbf.Relation, relations map
 	if relation.Tags["type"] == "multipolygon" || relation.Tags["type"] == "boundary" {
 		geometry, err = multipolygonGeometry(ways)
 	} else {
-		geometry, err = relationGeometry(db, ways, nodeIDs)
+		geometry, err = relationGeometry(cache, ways, nodeIDs)
 	}
 	if err != nil {
 		return geoJSONFeature{}, fmt.Errorf("failed to build relation %d geometry: %w", relation.ID, err)
 	}
+	bounds, err := geometryBounds(ways, cache, nodeIDs)
+	if err != nil {
+		return geoJSONFeature{}, fmt.Errorf("failed to build relation %d bounds: %w", relation.ID, err)
+	}
 	return geoJSONFeature{
 		Type:       "Feature",
 		ID:         fmt.Sprintf("relation/%d", relation.ID),
-		BBox:       geometryBounds(ways, db, nodeIDs),
+		BBox:       bounds,
 		Geometry:   geometry,
 		Properties: geoJSONProperties{OSMType: "relation", OSMID: relation.ID, Tags: trimTags(relation.Tags)},
 	}, nil
@@ -686,9 +744,11 @@ func multipolygonGeometry(ways []relationWay) (geoJSONGeometry, error) {
 
 	polygons := make([][][][]float64, len(outerRings))
 	for index, ring := range outerRings {
-		polygons[index] = [][][]float64{ring}
+		outerRings[index] = normalizeRing(ring, false)
+		polygons[index] = [][][]float64{outerRings[index]}
 	}
 	for _, inner := range innerRings {
+		inner = normalizeRing(inner, true)
 		assigned := false
 		for outerIndex, outer := range outerRings {
 			if pointInRing(inner[0], outer) {
@@ -710,17 +770,17 @@ func multipolygonGeometry(ways []relationWay) (geoJSONGeometry, error) {
 	return geoJSONGeometry{Type: "MultiPolygon", Coordinates: encoded}, err
 }
 
-func relationGeometry(db *leveldb.DB, ways []relationWay, nodeIDs []int64) (geoJSONGeometry, error) {
+func relationGeometry(cache pbfFeatureCache, ways []relationWay, nodeIDs []int64) (geoJSONGeometry, error) {
 	geometries := make([]geoJSONGeometry, 0, len(ways)+len(nodeIDs))
 	for _, way := range ways {
-		geometry, err := geometryFromCoordinates(way.Coordinates)
+		geometry, err := geometryFromCoordinates(way.Coordinates, nil)
 		if err != nil {
 			return geoJSONGeometry{}, err
 		}
 		geometries = append(geometries, geometry)
 	}
 	for _, nodeID := range nodeIDs {
-		latlon, err := cacheLookupNodeByID(db, nodeID)
+		latlon, err := cache.LookupNodeByID(nodeID)
 		if err != nil {
 			return geoJSONGeometry{}, fmt.Errorf("failed to find member node %d: %w", nodeID, err)
 		}
@@ -833,7 +893,7 @@ func pointInRing(point []float64, ring [][]float64) bool {
 	return inside
 }
 
-func geometryBounds(ways []relationWay, db *leveldb.DB, nodeIDs []int64) []float64 {
+func geometryBounds(ways []relationWay, cache pbfFeatureCache, nodeIDs []int64) ([]float64, error) {
 	bounds := []float64{math.Inf(1), math.Inf(1), math.Inf(-1), math.Inf(-1)}
 	for _, way := range ways {
 		for _, coordinate := range way.Coordinates {
@@ -841,16 +901,20 @@ func geometryBounds(ways []relationWay, db *leveldb.DB, nodeIDs []int64) []float
 		}
 	}
 	for _, nodeID := range nodeIDs {
-		if latlon, err := cacheLookupNodeByID(db, nodeID); err == nil {
-			if coordinates, err := coordinatesFromLatLons([]map[string]string{latlon}); err == nil {
-				extendBounds(bounds, coordinates[0])
-			}
+		latlon, err := cache.LookupNodeByID(nodeID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to find member node %d: %w", nodeID, err)
 		}
+		coordinates, err := coordinatesFromLatLons([]map[string]string{latlon})
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode member node %d: %w", nodeID, err)
+		}
+		extendBounds(bounds, coordinates[0])
 	}
 	if math.IsInf(bounds[0], 1) {
-		return nil
+		return nil, nil
 	}
-	return bounds
+	return bounds, nil
 }
 
 func extendBounds(bounds, coordinate []float64) {
@@ -893,7 +957,10 @@ func isWheelchairAccessibleNode(node *osmpbf.Node) uint8 {
 }
 
 // decode bytes to a 'latlon' type object
-func bytesToLatLon(data []byte) map[string]string {
+func bytesToLatLon(data []byte) (map[string]string, error) {
+	if len(data) != 12 && len(data) != 13 {
+		return nil, fmt.Errorf("cached node coordinate has %d bytes; expected 12 bytes or 13 bytes with entrance metadata", len(data))
+	}
 	buf := make([]byte, 8)
 	latlon := make(map[string]string, 4)
 
@@ -916,7 +983,7 @@ func bytesToLatLon(data []byte) map[string]string {
 		latlon["wheelchair"] = fmt.Sprintf("%d", (data[12]&0x30)>>4)
 	}
 
-	return latlon
+	return latlon, nil
 }
 
 // encode a node as bytes (between 12 & 13 bytes used)
@@ -954,16 +1021,16 @@ func idSliceToBytes(ids []int64) []byte {
 	return buf
 }
 
-func bytesToIDSlice(bytes []byte) []int64 {
-	if len(bytes)%8 != 0 {
-		log.Fatal("invalid byte slice length: not divisible by 8")
+func bytesToIDSlice(data []byte) ([]int64, error) {
+	if len(data)%8 != 0 {
+		return nil, fmt.Errorf("cached way node references have %d bytes; expected a multiple of 8", len(data))
 	}
 
-	ids := make([]int64, len(bytes)/8)
-	for i := 0; i < len(bytes)/8; i++ {
-		ids[i] = int64(binary.BigEndian.Uint64(bytes[8*i:]))
+	ids := make([]int64, len(data)/8)
+	for i := 0; i < len(data)/8; i++ {
+		ids[i] = int64(binary.BigEndian.Uint64(data[8*i:]))
 	}
-	return ids
+	return ids, nil
 }
 
 // encode a way as bytes (repeated int64 numbers)
@@ -973,26 +1040,17 @@ func wayToBytes(way *osmpbf.Way) (string, []byte) {
 	return stringid, idSliceToBytes(way.NodeIDs)
 }
 
-func openFile(filename string) *os.File {
+func openFile(filename string) (*os.File, error) {
 	// no file specified
 	if len(filename) < 1 {
-		log.Fatal("invalid file: you must specify a pbf path as arg[1]")
+		return nil, fmt.Errorf("invalid file: you must specify a PBF path")
 	}
 	// try to open the file
 	file, err := os.Open(filename)
 	if err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("failed to open PBF file %q: %w", filename, err)
 	}
-	return file
-}
-
-func openLevelDB(path string) *leveldb.DB {
-	// try to open the db
-	db, err := leveldb.OpenFile(path, &opt.Options{ErrorIfExist: true})
-	if err != nil {
-		log.Fatalf("failed to create new LevelDB at %q: %v", path, err)
-	}
-	return db
+	return file, nil
 }
 
 // extract all keys to array
@@ -1136,7 +1194,10 @@ func selectEntrance(entrances []map[string]string) map[string]string {
 }
 
 // compute the centroid of a way and its bbox
-func computeCentroidAndBounds(latlons []map[string]string) (map[string]string, *geo.Bound) {
+func computeCentroidAndBounds(latlons []map[string]string) (map[string]string, *geo.Bound, error) {
+	if len(latlons) == 0 {
+		return nil, nil, fmt.Errorf("expected at least one cached coordinate")
+	}
 
 	// check to see if there is a tagged entrance we can use.
 	var entrances []map[string]string
@@ -1151,18 +1212,24 @@ func computeCentroidAndBounds(latlons []map[string]string) (map[string]string, *
 	for index, each := range latlons {
 		lon, err := strconv.ParseFloat(each["lon"], 64)
 		if err != nil {
-			panic(fmt.Sprintf("cached coordinate %d has invalid longitude %q: %v", index, each["lon"], err))
+			return nil, nil, fmt.Errorf("cached coordinate %d has invalid longitude %q: %w", index, each["lon"], err)
 		}
 		lat, err := strconv.ParseFloat(each["lat"], 64)
 		if err != nil {
-			panic(fmt.Sprintf("cached coordinate %d has invalid latitude %q: %v", index, each["lat"], err))
+			return nil, nil, fmt.Errorf("cached coordinate %d has invalid latitude %q: %w", index, each["lat"], err)
+		}
+		if math.IsNaN(lon) || math.IsInf(lon, 0) || lon < -180 || lon > 180 {
+			return nil, nil, fmt.Errorf("cached coordinate %d longitude %q is outside -180 through 180", index, each["lon"])
+		}
+		if math.IsNaN(lat) || math.IsInf(lat, 0) || lat < -90 || lat > 90 {
+			return nil, nil, fmt.Errorf("cached coordinate %d latitude %q is outside -90 through 90", index, each["lat"])
 		}
 		points.Push(geo.NewPoint(lon, lat))
 	}
 
 	// use the mapped entrance location where available
 	if len(entrances) > 0 {
-		return selectEntrance(entrances), points.Bound()
+		return selectEntrance(entrances), points.Bound(), nil
 	}
 
 	// determine if the way is a closed centroid or a linestring
@@ -1185,7 +1252,7 @@ func computeCentroidAndBounds(latlons []map[string]string) (map[string]string, *
 	centroid["lat"] = formatCoordinate(compute.Lat())
 	centroid["lon"] = formatCoordinate(compute.Lng())
 
-	return centroid, points.Bound()
+	return centroid, points.Bound(), nil
 }
 
 func formatCoordinate(value float64) string {

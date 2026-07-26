@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 )
 
-const DefaultMVTIDProperty = "__geotools_geojson_id"
+const (
+	DefaultMVTIDProperty    = "__geotools_geojson_id"
+	DefaultMVTMaxInputBytes = 64 * 1024 * 1024
+)
 
 type Feature struct {
 	Type       string
@@ -40,9 +44,13 @@ type MVTDecodeSettings struct {
 	AllLayers     bool
 	LayerProperty string
 	IDProperty    string
+	MaxInputBytes int64
 }
 
 func (feature *Feature) UnmarshalJSON(data []byte) error {
+	if err := validateUniqueJSONMembers(data); err != nil {
+		return err
+	}
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(data, &members); err != nil {
 		return err
@@ -65,6 +73,76 @@ func (feature *Feature) UnmarshalJSON(data []byte) error {
 		default:
 			feature.Foreign[key] = cloneRawMessage(value)
 		}
+	}
+	return nil
+}
+
+func validateUniqueJSONMembers(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := validateUniqueJSONValue(decoder); err != nil {
+		return err
+	}
+	if token, err := decoder.Token(); err != io.EOF {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("JSON value has trailing token %v", token)
+	}
+	return nil
+}
+
+func validateUniqueJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, isDelimiter := token.(json.Delim)
+	if !isDelimiter {
+		return nil
+	}
+	if delimiter == '[' {
+		for decoder.More() {
+			if err := validateUniqueJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if end != json.Delim(']') {
+			return fmt.Errorf("JSON array ended with %v instead of ]", end)
+		}
+		return nil
+	}
+	if delimiter != '{' {
+		return fmt.Errorf("unexpected JSON delimiter %q", delimiter)
+	}
+	seen := make(map[string]bool)
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return fmt.Errorf("JSON object key has type %T; expected string", keyToken)
+		}
+		if seen[key] {
+			return fmt.Errorf("JSON object contains duplicate member %q", key)
+		}
+		seen[key] = true
+		if err := validateUniqueJSONValue(decoder); err != nil {
+			return err
+		}
+	}
+	end, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if end != json.Delim('}') {
+		return fmt.Errorf("JSON object ended with %v instead of }", end)
 	}
 	return nil
 }

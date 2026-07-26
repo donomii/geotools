@@ -135,3 +135,22 @@ func TestTransformJSONFGGeometryUsesEPSG4326AxisOrder(t *testing.T) {
 		t.Fatalf("CRS84 coordinates are %v; expected longitude then latitude", point.FlatCoords())
 	}
 }
+
+func TestWebMercatorRejectsCoordinatesOutsideItsWorldExtent(t *testing.T) {
+	for _, point := range []*geom.Point{
+		geom.NewPointFlat(geom.XY, []float64{0, 85.1}),
+		geom.NewPointFlat(geom.XY, []float64{181, 0}),
+	} {
+		if _, err := TransformGeometry(point, CRSCRS84, CRSEPSG3857); err == nil {
+			t.Fatalf("accepted WGS84 coordinate %v outside Web Mercator", point.FlatCoords())
+		}
+	}
+	for _, point := range []*geom.Point{
+		geom.NewPointFlat(geom.XY, []float64{20037509, 0}),
+		geom.NewPointFlat(geom.XY, []float64{0, -20037509}),
+	} {
+		if _, err := TransformGeometry(point, CRSEPSG3857, CRSCRS84); err == nil {
+			t.Fatalf("accepted Web Mercator coordinate %v outside its world extent", point.FlatCoords())
+		}
+	}
+}

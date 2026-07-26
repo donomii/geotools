@@ -84,11 +84,49 @@ func propertiesMatch(properties map[string]json.RawMessage, required []string, e
 	}
 	for key, expectedValue := range expected {
 		actual, exists := properties[key]
-		if !exists || !bytes.Equal(compactJSON(actual), expectedValue) {
+		if !exists || !equalJSONValue(actual, expectedValue) {
 			return false
 		}
 	}
 	return true
+}
+
+func equalJSONValue(first, second json.RawMessage) bool {
+	first = bytes.TrimSpace(first)
+	second = bytes.TrimSpace(second)
+	if len(first) == 0 || len(second) == 0 || first[0] != second[0] {
+		return false
+	}
+	switch first[0] {
+	case '{':
+		var firstMembers, secondMembers map[string]json.RawMessage
+		if json.Unmarshal(first, &firstMembers) != nil || json.Unmarshal(second, &secondMembers) != nil || len(firstMembers) != len(secondMembers) {
+			return false
+		}
+		for name, firstValue := range firstMembers {
+			secondValue, exists := secondMembers[name]
+			if !exists || !equalJSONValue(firstValue, secondValue) {
+				return false
+			}
+		}
+		return true
+	case '[':
+		var firstValues, secondValues []json.RawMessage
+		if json.Unmarshal(first, &firstValues) != nil || json.Unmarshal(second, &secondValues) != nil || len(firstValues) != len(secondValues) {
+			return false
+		}
+		for index := range firstValues {
+			if !equalJSONValue(firstValues[index], secondValues[index]) {
+				return false
+			}
+		}
+		return true
+	case '"':
+		var firstText, secondText string
+		return json.Unmarshal(first, &firstText) == nil && json.Unmarshal(second, &secondText) == nil && firstText == secondText
+	default:
+		return bytes.Equal(first, second)
+	}
 }
 
 func compactJSON(value json.RawMessage) json.RawMessage {
@@ -110,7 +148,19 @@ func selectProperties(properties map[string]json.RawMessage, selected map[string
 }
 
 func boundsIntersect(first, second [4]float64) bool {
-	return first[0] <= second[2] && first[2] >= second[0] && first[1] <= second[3] && first[3] >= second[1]
+	if first[1] > second[3] || first[3] < second[1] {
+		return false
+	}
+	if first[0] > first[2] && second[0] > second[2] {
+		return true
+	}
+	if first[0] > first[2] {
+		return second[2] >= first[0] || second[0] <= first[2]
+	}
+	if second[0] > second[2] {
+		return first[2] >= second[0] || first[0] <= second[2]
+	}
+	return first[0] <= second[2] && first[2] >= second[0]
 }
 
 func parseList(value string) (map[string]bool, error) {
@@ -128,17 +178,44 @@ func parseList(value string) (map[string]bool, error) {
 	return result, nil
 }
 
+func validateGeometryTypes(types map[string]bool, allowNull bool) error {
+	valid := map[string]bool{
+		"Point": true, "MultiPoint": true, "LineString": true, "MultiLineString": true,
+		"Polygon": true, "MultiPolygon": true, "GeometryCollection": true,
+	}
+	if allowNull {
+		valid["null"] = true
+	}
+	expected := "a GeoJSON geometry type"
+	if allowNull {
+		expected += " or null"
+	}
+	for geometryType := range types {
+		if !valid[geometryType] {
+			return fmt.Errorf("geometry type %q is unsupported; expected %s", geometryType, expected)
+		}
+	}
+	return nil
+}
+
 func parseWhere(value string) (map[string]json.RawMessage, error) {
 	result := make(map[string]json.RawMessage)
 	if value == "" {
 		return result, nil
 	}
-	for _, condition := range strings.Split(value, ",") {
+	conditions, err := splitWhereConditions(value)
+	if err != nil {
+		return nil, err
+	}
+	for _, condition := range conditions {
 		parts := strings.SplitN(condition, "=", 2)
 		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" {
 			return nil, fmt.Errorf("condition %q must have the form property=value", condition)
 		}
 		key := strings.TrimSpace(parts[0])
+		if _, exists := result[key]; exists {
+			return nil, fmt.Errorf("property %q has more than one condition", key)
+		}
 		expected := strings.TrimSpace(parts[1])
 		if expected == "" {
 			return nil, fmt.Errorf("condition %q has an empty expected value", condition)
@@ -154,6 +231,54 @@ func parseWhere(value string) (map[string]json.RawMessage, error) {
 		result[key] = compactJSON(raw)
 	}
 	return result, nil
+}
+
+func splitWhereConditions(value string) ([]string, error) {
+	var conditions []string
+	var brackets []byte
+	start := 0
+	inString := false
+	escaped := false
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if inString {
+			if escaped {
+				escaped = false
+			} else if character == '\\' {
+				escaped = true
+			} else if character == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch character {
+		case '"':
+			inString = true
+		case '[', '{':
+			brackets = append(brackets, character)
+		case ']', '}':
+			if len(brackets) == 0 {
+				return nil, fmt.Errorf("conditions %q contain unmatched %q", value, character)
+			}
+			open := brackets[len(brackets)-1]
+			if (open == '[' && character != ']') || (open == '{' && character != '}') {
+				return nil, fmt.Errorf("conditions %q close %q with %q", value, open, character)
+			}
+			brackets = brackets[:len(brackets)-1]
+		case ',':
+			if len(brackets) == 0 {
+				conditions = append(conditions, value[start:index])
+				start = index + 1
+			}
+		}
+	}
+	if inString {
+		return nil, fmt.Errorf("conditions %q contain an unterminated JSON string", value)
+	}
+	if len(brackets) > 0 {
+		return nil, fmt.Errorf("conditions %q contain unclosed %q", value, brackets[len(brackets)-1])
+	}
+	return append(conditions, value[start:]), nil
 }
 
 func parseBBox(value string) ([4]float64, bool, error) {
@@ -175,8 +300,14 @@ func parseBBox(value string) ([4]float64, bool, error) {
 		}
 		result[index] = number
 	}
-	if result[0] > result[2] || result[1] > result[3] {
-		return result, false, fmt.Errorf("bbox %q has minimum values greater than maximum values", value)
+	if result[0] < -180 || result[0] > 180 || result[2] < -180 || result[2] > 180 {
+		return result, false, fmt.Errorf("bbox %q has longitude outside -180 through 180", value)
+	}
+	if result[1] < -90 || result[1] > 90 || result[3] < -90 || result[3] > 90 {
+		return result, false, fmt.Errorf("bbox %q has latitude outside -90 through 90", value)
+	}
+	if result[1] > result[3] {
+		return result, false, fmt.Errorf("bbox %q has minimum latitude greater than maximum latitude", value)
 	}
 	return result, true, nil
 }
@@ -210,7 +341,7 @@ func main() {
 	whereValue := flag.String("where", "", "Comma-separated exact property conditions such as kind=city,population=42; JSON numbers, booleans, and null retain their types")
 	selectValue := flag.String("select", "", "Comma-separated properties to keep in emitted Features; empty keeps every property")
 	dropValue := flag.String("drop", "", "Comma-separated properties to remove from emitted Features; cannot be combined with -select")
-	bboxValue := flag.String("bbox", "", "Retain geometries intersecting minLon,minLat,maxLon,maxLat; empty disables spatial filtering")
+	bboxValue := flag.String("bbox", "", "Retain geometries intersecting minLon,minLat,maxLon,maxLat; minLon greater than maxLon crosses the antimeridian, and empty disables spatial filtering")
 	limit := flag.Int64("limit", -1, "Stop after emitting exactly this many Features; -1 has no limit and 0 emits none")
 	allowNull := flag.Bool("allow-null-geometry", false, "Accept null geometries; they are retained only when no geometry or bbox filter excludes them")
 	runTest := flag.Bool("test", false, "Run a built-in property and geometry filter check and exit")
@@ -238,6 +369,9 @@ func main() {
 	}
 	geometryTypes, err := parseList(*geometryValue)
 	if err != nil {
+		log.Fatal(err)
+	}
+	if err := validateGeometryTypes(geometryTypes, *allowNull); err != nil {
 		log.Fatal(err)
 	}
 	requiredMap, err := parseList(*hasValue)

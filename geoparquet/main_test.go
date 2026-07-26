@@ -362,6 +362,23 @@ func TestDecodeExternalGeoParquetNullAndSecondaryGeometryColumns(t *testing.T) {
 	}
 }
 
+func TestDecodeNativeGeoParquetRejectsPartiallyNullCoordinates(t *testing.T) {
+	values := [][]parquet.Value{
+		{
+			parquet.NullValue().Level(0, 0, 0),
+			parquet.DoubleValue(2).Level(0, 1, 0),
+		},
+		{
+			parquet.DoubleValue(1).Level(0, 1, 1),
+			parquet.NullValue().Level(0, 0, 1),
+		},
+	}
+	paths := [][]string{{"geometry", "x"}, {"geometry", "y"}}
+	if _, err := decodeGeoParquetGeometry(values, paths, "geometry", "point"); err == nil {
+		t.Fatal("accepted native GeoParquet coordinate slots with independently null axes")
+	}
+}
+
 func TestDecodeDuckDBGeoParquetFixture(t *testing.T) {
 	data, err := os.ReadFile("../testdata/external/duckdb_geoparquet.parquet")
 	if err != nil {

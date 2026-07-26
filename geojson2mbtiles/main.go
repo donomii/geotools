@@ -66,13 +66,10 @@ func writeMBTiles(input io.Reader, outputPath string, settings archiveSettings) 
 	}
 	writeErr := writeMBTilesDatabase(database, input, settings)
 	closeErr := database.Close()
-	if writeErr != nil {
-		return writeErr
-	}
 	if closeErr != nil {
-		return fmt.Errorf("failed to close MBTiles output %q: %w", outputPath, closeErr)
+		closeErr = fmt.Errorf("failed to close MBTiles output %q: %w", outputPath, closeErr)
 	}
-	return nil
+	return errors.Join(writeErr, closeErr)
 }
 
 func validateArchiveSettings(settings archiveSettings) error {

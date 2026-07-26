@@ -1,26 +1,60 @@
-[![Build Status](https://travis-ci.org/donomii/geojson2entirety.svg?branch=master)](https://travis-ci.org/donomii/geojson2entirety)
-[![GoDoc](https://godoc.org/github.com/donomii/geojson2entirety?status.svg)](https://godoc.org/github.com/donomii/geojson2entirety)
-
 # geojson2entirety
-Importer for the entirety maptool
+
+`geojson2entirety` converts WGS 84 GeoJSON Point Features into the eight binary files consumed by the Entirety map viewer. It reads from standard input and writes files using a configurable prefix.
+
+## Build
+
+From the Geotools repository root:
+
+```sh
+./build_all.sh
+```
+
+Or build this module directly:
+
+```sh
+mkdir -p bin
+go -C geojson2entirety build -o ../bin/geojson2entirety .
+```
 
 ## Use
 
-    cat data.geojson | geojson2entirety --outFile myMap --limit 1000
+```sh
+./bin/geojson2entirety -outFile=world < places.geojson
+./bin/geojson2entirety -outFile=sample -limit=1000 < places.geojsonl
+```
 
-Will create a set of entirety map files called "myMap", using the first 1000 points from data.geojson
+Input may be a GeoJSON `FeatureCollection`, an array of Features, GeoJSONL, or consecutive top-level Features. RFC 8142 record separators are not accepted. Every Feature must have a two-dimensional Point with finite longitude from -180 through 180 and latitude from -90 through 90. A non-empty string `properties.name` creates a tag; a missing, null, or empty name creates an ordinary map point.
+
+The command creates or truncates these files immediately:
+
+```text
+world.tag_points
+world.map_points
+world.map_data
+world.tag_category
+world.pre_offset
+world.tag_offset
+world.tag_text
+world.tag_index
+```
 
 ## Options
 
-    --outFile mapName   Will create binary map files named mapName
-    --limit n           Will stop after converting n points.  Omit --limit to convert the entire file
+| Option | Meaning |
+| --- | --- |
+| `-outFile=default_map` | Prefix for all eight output files. |
+| `-limit=-1` | Stop after this many Features. `-1` converts all input and `0` converts none. |
+| `-points` | Write every Feature as an unnamed map point and omit all tag records. |
+| `-tags` | Write only named Features as tags and omit unnamed map points. It cannot be combined with `-points`. |
+| `-verbose` | Log every converted point or tag. |
+| `-test` | Run the built-in conversion checks and exit without creating map files. |
 
-## Entirety
+The converter streams Features and uses fixed-size buffers for the eight outputs. A failed conversion may leave partially written output files.
 
-The Entirety maptool displays the planet, in its entirety.  Using data from multiple sources, we display every known location on the planet, in a responsive interface.  *geojson2entirety* converts slightly non-standard geojson into the Entirety map format, ready for display.
+## Test
 
-## Format
-
-Entirety geojson expects input in a slightly non-standard format.  Each element (each *feature*) must be on its own line, followed by a newline \n.  This allows the parser to easily resume after an error, and also makes the import (and generation) code much smaller and easier to write.
-
-I plan to fix this in the future.
+```sh
+go -C geojson2entirety test ./...
+./bin/geojson2entirety -test
+```

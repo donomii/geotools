@@ -1,68 +1,58 @@
-[![Build Status](https://travis-ci.org/donomii/osm2geojson.svg?branch=master)](https://travis-ci.org/donomii/osm2geojson)
-
 # osm2geojson
-Converts Open Street Map osm files into geojson, or optionally "one feature per line" format
 
-Works on osm files or streams, allowing it to process files directly from the network, without downloading them first.
+`osm2geojson` converts OpenStreetMap XML into WGS 84 GeoJSON. It resolves node references, classifies ways as lines or areas from their tags, assembles multipolygon and boundary relations, expands nested relations, and validates missing or cyclic references.
 
-# To do
+## Build
 
-Note osm2geojson currently extracts only points.  More complicated structures are not implemented yet.
+From the Geotools repository root:
 
-# To install
+```sh
+./build_all.sh
+```
 
-    go get github.com/donomii/osm2geojson
-    go install github.com/donomii/osm2geojson
+Or build this module directly:
 
-# To use
+```sh
+mkdir -p bin
+go -C osm2geojson/osm2geojson build -o ../../bin/osm2geojson .
+```
 
-## As a stream processor
+## Use
 
-    cat europe.osm | ./osm2geojson
+```sh
+./bin/osm2geojson region.osm region.geojsonl
+./bin/osm2geojson -strict region.osm region.geojson
+./bin/osm2geojson region.osm.gz region.geojson.gz
+./bin/osm2geojson -compression=bz2 - converted.geojsonl
+```
 
-    type europe.osm | osm2geojson
-	
-## Converting directly from the internet
+The positional arguments are `[input|-] [output|-]`. With no paths, the command reads standard input and writes standard output. `-` explicitly selects either stream.
 
-	wget -q -O - http://download.geofabrik.de/antarctica-latest.osm.bz2 | bunzip2  | ./osm2geojson
-	
-	or you can use the --compression flag to use the internal decompressor
-	
-	wget -q -O - http://download.geofabrik.de/antarctica-latest.osm.bz2 |  ./osm2geojson --compression bz2
-	
+Input filenames ending in `.gz` or `.bz2` are decompressed automatically. For compressed standard input, set `-compression=gz` or `-compression=bz2`. An output filename ending in `.gz` is gzip-compressed.
 
-## Read from file, write to stdout
+## Output
 
-    ./osm2geojson europe.osm.bz2
+The default is one compact Feature per line. `-strict` writes one GeoJSON `FeatureCollection`.
 
-    osm2geojson europe.osm.bz2 
+Element IDs use `node/ID`, `way/ID`, and `relation/ID`. Properties retain `osm_type`, numeric `osm_id`, and all tags. Node geometries are Points. Ways become Polygons only when their tags describe an area or explicitly set `area=yes`; other closed ways remain LineStrings. Polygon exterior rings are counterclockwise and holes are clockwise. Multipolygon and boundary relations become Polygon or MultiPolygon geometries; other relations become GeometryCollections.
 
-## Read from file, write to file
+For a named input, the command makes two streaming passes without a temporary copy. The first pass records references; the second emits Features and releases resolved nodes and ways. Standard input cannot be rewound and therefore uses a one-pass in-memory fallback.
 
-    ./osm2geojson europe.osm.bz2 europe.geojson.gz
+## Options
 
-    osm2geojson europe.osm.bz2 europe.geojson.gz
+| Option | Meaning |
+| --- | --- |
+| `-compression=''` | Detect gzip or bzip2 from the input filename. This is the default. |
+| `-compression=gz` | Force gzip decompression. |
+| `-compression=bz2` | Force bzip2 decompression. |
+| `-strict` | Write one FeatureCollection instead of GeoJSONL. |
+| `-test` | Run built-in node, way, relation, geometry, and compression checks. |
 
-## Read from stdin, write to file
+Only OpenStreetMap XML is accepted; use `pbf2json` for `.osm.pbf` input.
 
-    ./osm2geojson - europe.geojson.gz
+## Test
 
-    osm2geojson - europe.geojson.gz
-
-# Correct geojson format
-
-By default, osm2geojson prints each feature on a new line, so you can use command line tools like GREP and AWK to filter the results.  e.g. to get every mountain in Europe:
-
-	./osm2geojson europe.osm.bz2 | grep -i mountain
-	
-However this is not correct geojson.  To get correct geojson, add ```--strict``` to your command.
-
-	./osm2geojson --strict europe.osm.bz2
-	
-Note that correct geojson is all on one line, so you can no longer use command line tools.
-
-# Author
-
-Adapted from http://fabsk.eu/misc/osmxml.go
-
-Now maintained by Donomii
+```sh
+go -C osm2geojson/osm2geojson test ./...
+./bin/osm2geojson -test
+```

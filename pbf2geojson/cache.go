@@ -1,87 +1,191 @@
 package main
 
 import (
+	"fmt"
+	"strconv"
+
 	"github.com/qedus/osmpbf"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
-	"log"
-	"strconv"
 )
 
-// queue a leveldb write in a batch
-func cacheQueueNode(batch *leveldb.Batch, node *osmpbf.Node) {
-	id, val := nodeToBytes(node)
-	batch.Put([]byte(id), []byte(val))
+type pbfFeatureCache interface {
+	PutNode(node *osmpbf.Node) error
+	PutWay(way *osmpbf.Way) error
+	Flush() error
+	LookupNodeByID(id int64) (map[string]string, error)
+	LookupNodes(way *osmpbf.Way) ([]map[string]string, error)
+	LookupWayNodes(wayID int64) ([]map[string]string, error)
+	Close() error
 }
 
-// queue a leveldb write in a batch
-func cacheQueueWay(batch *leveldb.Batch, way *osmpbf.Way) {
-	id, val := wayToBytes(way)
-	batch.Put([]byte(id), []byte(val))
+type memoryNode struct {
+	data   [13]byte
+	length uint8
 }
 
-// flush a leveldb batch to database and reset batch to 0
-func cacheFlush(db *leveldb.DB, batch *leveldb.Batch, sync bool) {
-	var writeOpts = &opt.WriteOptions{
-		NoWriteMerge: true,
-		Sync:         sync,
+type memoryFeatureCache struct {
+	nodes map[int64]memoryNode
+	ways  map[int64][]int64
+}
+
+func newMemoryFeatureCache() *memoryFeatureCache {
+	return &memoryFeatureCache{
+		nodes: make(map[int64]memoryNode),
+		ways:  make(map[int64][]int64),
 	}
+}
 
-	err := db.Write(batch, writeOpts)
+func openPBFFeatureCache(path string, batchSize int) (pbfFeatureCache, error) {
+	if path == "" {
+		return newMemoryFeatureCache(), nil
+	}
+	return openLevelDBFeatureCache(path, batchSize)
+}
+
+func (cache *memoryFeatureCache) PutNode(node *osmpbf.Node) error {
+	_, encoded := nodeToBytes(node)
+	var stored memoryNode
+	copy(stored.data[:], encoded)
+	stored.length = uint8(len(encoded))
+	cache.nodes[node.ID] = stored
+	return nil
+}
+
+func (cache *memoryFeatureCache) PutWay(way *osmpbf.Way) error {
+	cache.ways[way.ID] = append([]int64(nil), way.NodeIDs...)
+	return nil
+}
+
+func (cache *memoryFeatureCache) Flush() error {
+	return nil
+}
+
+func (cache *memoryFeatureCache) LookupNodeByID(id int64) (map[string]string, error) {
+	node, ok := cache.nodes[id]
+	if !ok {
+		return nil, fmt.Errorf("node %d is not in the coordinate cache", id)
+	}
+	decoded, err := bytesToLatLon(node.data[:node.length])
 	if err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("node %d has invalid in-memory coordinate data: %w", id, err)
 	}
-	batch.Reset()
+	return decoded, nil
 }
 
-func cacheLookupNodeByID(db *leveldb.DB, id int64) (map[string]string, error) {
-	stringid := strconv.FormatInt(id, 10)
+func (cache *memoryFeatureCache) LookupNodes(way *osmpbf.Way) ([]map[string]string, error) {
+	return lookupPBFNodes(cache, way)
+}
 
-	data, err := db.Get([]byte(stringid), nil)
+func (cache *memoryFeatureCache) LookupWayNodes(wayID int64) ([]map[string]string, error) {
+	nodeIDs, ok := cache.ways[wayID]
+	if !ok {
+		return nil, fmt.Errorf("way %d is not in the member cache", wayID)
+	}
+	return lookupPBFNodes(cache, &osmpbf.Way{ID: wayID, NodeIDs: nodeIDs})
+}
+
+func (cache *memoryFeatureCache) Close() error {
+	return nil
+}
+
+type levelDBFeatureCache struct {
+	database  *leveldb.DB
+	batch     *leveldb.Batch
+	batchSize int
+}
+
+func openLevelDBFeatureCache(path string, batchSize int) (*levelDBFeatureCache, error) {
+	database, err := leveldb.OpenFile(path, &opt.Options{ErrorIfExist: true})
 	if err != nil {
-		log.Println("[warn] fetch failed for node ID:", stringid)
-		return make(map[string]string, 0), err
+		return nil, fmt.Errorf("failed to create new LevelDB at %q: %w", path, err)
 	}
-
-	return bytesToLatLon(data), nil
+	return &levelDBFeatureCache{database: database, batch: new(leveldb.Batch), batchSize: batchSize}, nil
 }
 
-func cacheLookupNodes(db *leveldb.DB, way *osmpbf.Way) ([]map[string]string, error) {
+func (cache *levelDBFeatureCache) PutNode(node *osmpbf.Node) error {
+	id, value := nodeToBytes(node)
+	cache.batch.Put([]byte(id), value)
+	return cache.flushFullBatch()
+}
 
-	var container []map[string]string
+func (cache *levelDBFeatureCache) PutWay(way *osmpbf.Way) error {
+	id, value := wayToBytes(way)
+	cache.batch.Put([]byte(id), value)
+	return cache.flushFullBatch()
+}
 
-	for _, each := range way.NodeIDs {
-		stringid := strconv.FormatInt(each, 10)
+func (cache *levelDBFeatureCache) flushFullBatch() error {
+	if cache.batch.Len() < cache.batchSize {
+		return nil
+	}
+	return cache.Flush()
+}
 
-		data, err := db.Get([]byte(stringid), nil)
-		if err != nil {
-			log.Println("[warn] denormalize failed for way:", way.ID, "node not found:", stringid)
-			return make([]map[string]string, 0), err
+func (cache *levelDBFeatureCache) Flush() error {
+	if cache.batch.Len() == 0 {
+		return nil
+	}
+	options := &opt.WriteOptions{NoWriteMerge: true, Sync: true}
+	if err := cache.database.Write(cache.batch, options); err != nil {
+		return fmt.Errorf("failed to write %d cached PBF elements to LevelDB: %w", cache.batch.Len(), err)
+	}
+	cache.batch.Reset()
+	return nil
+}
+
+func (cache *levelDBFeatureCache) LookupNodeByID(id int64) (map[string]string, error) {
+	key := strconv.FormatInt(id, 10)
+	data, err := cache.database.Get([]byte(key), nil)
+	if err != nil {
+		return nil, fmt.Errorf("node %d is not in the LevelDB coordinate cache: %w", id, err)
+	}
+	decoded, err := bytesToLatLon(data)
+	if err != nil {
+		return nil, fmt.Errorf("node %d has invalid LevelDB coordinate data: %w", id, err)
+	}
+	return decoded, nil
+}
+
+func (cache *levelDBFeatureCache) LookupNodes(way *osmpbf.Way) ([]map[string]string, error) {
+	return lookupPBFNodes(cache, way)
+}
+
+func (cache *levelDBFeatureCache) LookupWayNodes(wayID int64) ([]map[string]string, error) {
+	key := "W" + strconv.FormatInt(wayID, 10)
+	data, err := cache.database.Get([]byte(key), nil)
+	if err != nil {
+		return nil, fmt.Errorf("way %d is not in the LevelDB member cache: %w", wayID, err)
+	}
+	nodeIDs, err := bytesToIDSlice(data)
+	if err != nil {
+		return nil, fmt.Errorf("way %d has invalid LevelDB member data: %w", wayID, err)
+	}
+	return lookupPBFNodes(cache, &osmpbf.Way{ID: wayID, NodeIDs: nodeIDs})
+}
+
+func (cache *levelDBFeatureCache) Close() error {
+	if err := cache.Flush(); err != nil {
+		closeErr := cache.database.Close()
+		if closeErr != nil {
+			return fmt.Errorf("%v; LevelDB close also failed: %w", err, closeErr)
 		}
-
-		container = append(container, bytesToLatLon(data))
+		return err
 	}
-
-	return container, nil
+	if err := cache.database.Close(); err != nil {
+		return fmt.Errorf("failed to close the LevelDB PBF feature cache: %w", err)
+	}
+	return nil
 }
 
-func cacheLookupWayNodes(db *leveldb.DB, wayid int64) ([]map[string]string, error) {
-
-	// prefix the key with 'W' to differentiate it from node ids
-	stringid := "W" + strconv.FormatInt(wayid, 10)
-
-	// look up way bytes
-	reldata, err := db.Get([]byte(stringid), nil)
-	if err != nil {
-		log.Println("[warn] lookup failed for way:", wayid, "noderefs not found:", stringid)
-		return make([]map[string]string, 0), err
+func lookupPBFNodes(cache pbfFeatureCache, way *osmpbf.Way) ([]map[string]string, error) {
+	nodes := make([]map[string]string, 0, len(way.NodeIDs))
+	for _, nodeID := range way.NodeIDs {
+		node, err := cache.LookupNodeByID(nodeID)
+		if err != nil {
+			return nil, fmt.Errorf("way %d node %d cannot be resolved: %w", way.ID, nodeID, err)
+		}
+		nodes = append(nodes, node)
 	}
-
-	// generate a way object
-	var way = &osmpbf.Way{
-		ID:      wayid,
-		NodeIDs: bytesToIDSlice(reldata),
-	}
-
-	return cacheLookupNodes(db, way)
+	return nodes, nil
 }

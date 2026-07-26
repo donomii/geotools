@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
@@ -127,6 +128,34 @@ func TestConvertEntiretyRejectsNonStringName(t *testing.T) {
 	}
 	if convertErr == nil || !strings.Contains(convertErr.Error(), "Feature name must be a string") {
 		t.Fatalf("received error %v", convertErr)
+	}
+}
+
+func TestEntiretyPointRejectsCoordinatesItCannotRepresent(t *testing.T) {
+	tests := []struct {
+		name        string
+		coordinates string
+		expected    string
+	}{
+		{name: "missing latitude", coordinates: `[1]`, expected: "requires exactly longitude and latitude"},
+		{name: "third dimension", coordinates: `[1,2,3]`, expected: "requires exactly longitude and latitude"},
+		{name: "longitude below range", coordinates: `[-181,2]`, expected: "outside WGS84 longitude"},
+		{name: "longitude above range", coordinates: `[181,2]`, expected: "outside WGS84 longitude"},
+		{name: "latitude below range", coordinates: `[1,-91]`, expected: "outside WGS84 longitude"},
+		{name: "latitude above range", coordinates: `[1,91]`, expected: "outside WGS84 longitude"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			feature := entiretyFeature{
+				Type:       "Feature",
+				Geometry:   entiretyGeometry{Type: "Point", Coordinates: json.RawMessage(test.coordinates)},
+				Properties: map[string]json.RawMessage{},
+			}
+			_, _, _, _, err := entiretyPoint(feature)
+			if err == nil || !strings.Contains(err.Error(), test.expected) {
+				t.Fatalf("received error %v, expected text %q", err, test.expected)
+			}
+		})
 	}
 }
 
