@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"html"
 	"io"
 	"math"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/donomii/geotools/wikidump"
 	"github.com/dustin/go-wikiparse"
 )
 
@@ -132,6 +134,94 @@ func TestParsePageCoordsRejectsNonFiniteCoordinates(t *testing.T) {
 	}
 }
 
+func TestProcessWikipediaXMLPreamble(t *testing.T) {
+	expected := processCoordinateDump(t, false, 3)
+	input := "\uFEFF<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- Wikipedia export -->\n" + realWikipediaCoordinateDump
+	parser, err := wikidump.NewParser(strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := process(parser, &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != expected {
+		t.Fatalf("declared XML output is %q, expected %q", output.String(), expected)
+	}
+}
+
+func TestWikipediaCoordinateTemplatesFromXML(t *testing.T) {
+	cases := []struct {
+		name      string
+		text      string
+		longitude float64
+		latitude  float64
+	}{
+		{"decimal", `{{coord|61.1631|-149.9721|display=title}}`, -149.9721, 61.1631},
+		{"decimal directions", `{{coord|29.5734571|N|2.3730469|E}}`, 2.3730469, 29.5734571},
+		{"minutes", `{{Coord|50|40|N|1|16|W|region:GB_type:isle}}`, -1 - 16.0/60, 50 + 40.0/60},
+		{"seconds", `{{coord|27|59|16|S|86|56|40|W}}`, -86 - 56.0/60 - 40.0/3600, -27 - 59.0/60 - 16.0/3600},
+		{"leading metadata", `{{Coord|display=title|41.762736| -72.674286}}`, -72.674286, 41.762736},
+		{"nested metadata", `{{coord|1|2|name={{lang|en|Example}}}}`, 2, 1},
+		{"empty optional fields", `{{Coord|42||N|82||W|}}`, -82, 42},
+		{"spaces", "{{ Coord \n| 1 | 2 | display=title }}", 2, 1},
+		{"separate comments", `<!-- first --> {{coord|1|2}} <!-- second -->`, 2, 1},
+		{"hidden templates", `<!-- {{coord|3|4}} --> {{coord|1|2}} <!-- {{coord|5|6}} -->`, 2, 1},
+		{"separate nowiki", `<nowiki>{{coord|3|4}}</nowiki>{{coord|1|2}}<nowiki>{{coord|5|6}}</nowiki>`, 2, 1},
+		{"empty nowiki", `<nowiki />{{coord|1|2}}<nowiki>{{coord|5|6}}</nowiki>`, 2, 1},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			parser, err := wikidump.NewParser(strings.NewReader(coordinatePageXML(test.text)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			page, err := parser.Next()
+			if err != nil {
+				t.Fatal(err)
+			}
+			feature, found, err := parsePageCoords(page)
+			if err != nil || !found {
+				t.Fatalf("coordinate template %q returned found=%v, error=%v", test.text, found, err)
+			}
+			assertWikiPoint(t, *feature, "Coordinates", test.longitude, test.latitude)
+		})
+	}
+}
+
+func TestProcessReportsIncompleteCoordinatesAndContinues(t *testing.T) {
+	t.Chdir(t.TempDir())
+	for _, template := range []string{
+		"{{coord|1|N}}", "{{coord|1|S}}", "{{coord|51|30|N}}", "{{coord|51|30|0|N}}", "{{coord|bad|1|2}}",
+	} {
+		input := coordinatePageXML(template)
+		input = strings.Replace(input, "</mediawiki>", `<page><title>Valid</title><id>2</id><revision><text>{{coord|1|2}}</text></revision></page></mediawiki>`, 1)
+		parser, err := wikidump.NewParser(strings.NewReader(input))
+		if err != nil {
+			t.Fatal(err)
+		}
+		numWorkers = 2
+		strict = false
+		var output bytes.Buffer
+		if err := process(parser, &output); err != nil {
+			t.Fatal(err)
+		}
+		var feature wikiFeature
+		if err := json.Unmarshal(output.Bytes(), &feature); err != nil {
+			t.Fatal(err)
+		}
+		assertWikiPoint(t, feature, "Valid", 2, 1)
+		if info, err := os.Stat("errors.gob"); err != nil || info.Size() == 0 {
+			t.Fatalf("incomplete coordinate page was not recorded: %v", err)
+		}
+	}
+}
+
+func coordinatePageXML(text string) string {
+	return `<mediawiki><siteinfo/><page><title>Coordinates</title><id>1</id><revision><text>` +
+		html.EscapeString(text) + `</text></revision></page></mediawiki>`
+}
+
 func TestOpenWikipediaInputReadsGzipAndReturnsErrors(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pages.xml.gz")
 	file, err := os.Create(path)
@@ -219,7 +309,7 @@ func TestWriteWikiResultsReleasesOrderedResultSlots(t *testing.T) {
 }
 
 func TestProcessReportsMalformedWikipediaXML(t *testing.T) {
-	parser, err := wikiparse.NewParser(strings.NewReader(strings.TrimSuffix(realWikipediaCoordinateDump, "</mediawiki>")))
+	parser, err := wikidump.NewParser(strings.NewReader(strings.TrimSuffix(realWikipediaCoordinateDump, "</mediawiki>")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +323,7 @@ func TestProcessReportsMalformedWikipediaXML(t *testing.T) {
 
 func processCoordinateDump(t *testing.T, strictOutput bool, workers int) string {
 	t.Helper()
-	parser, err := wikiparse.NewParser(strings.NewReader(realWikipediaCoordinateDump))
+	parser, err := wikidump.NewParser(strings.NewReader(realWikipediaCoordinateDump))
 	if err != nil {
 		t.Fatal(err)
 	}

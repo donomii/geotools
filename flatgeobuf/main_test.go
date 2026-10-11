@@ -79,6 +79,71 @@ func TestFlatGeobufRejectsReservedProperty(t *testing.T) {
 	}
 }
 
+func TestFlatGeobufGeometryCollectionRoundTrip(t *testing.T) {
+	geometries := []string{
+		`{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[1,2]}]}`,
+		`{"type":"GeometryCollection","geometries":[{"type":"GeometryCollection","geometries":[]},{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[1,2]},{"type":"LineString","coordinates":[[3,4],[5,6]]}]}]}`,
+	}
+	for _, geometry := range geometries {
+		for _, indexed := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/indexed=%t", geometry, indexed), func(t *testing.T) {
+				input := []byte(`{"type":"Feature","geometry":` + geometry + `,"properties":{}}`)
+				var encoded bytes.Buffer
+				settings := flatEncodeSettings{InputMode: geodata.InputAuto, LayerName: "collections", Indexed: indexed}
+				if err := encodeFlatGeobufWithSettings(bytes.NewReader(input), &encoded, settings); err != nil {
+					t.Fatal(err)
+				}
+				var output bytes.Buffer
+				if err := decodeFlatGeobuf(&encoded, &output, geodata.OutputCollection); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(sortedFlatFeatures(t, input), sortedFlatFeatures(t, output.Bytes())) {
+					t.Fatalf("GeometryCollection round trip changed Feature content: %s", output.Bytes())
+				}
+			})
+		}
+	}
+}
+
+func TestFlatGeobufDecodesPreservedEmptyGeometryCollection(t *testing.T) {
+	input := []byte(`{"type":"Feature","geometry":{"type":"GeometryCollection","geometries":[]},"properties":{}}`)
+	var feature geodata.Feature
+	if err := json.Unmarshal(input, &feature); err != nil {
+		t.Fatal(err)
+	}
+	geometry, err := geodata.DecodeGeomJSON(feature.Geometry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	columns := []flatColumn{{Name: preservedFeatureProperty, Type: flat.ColumnTypeString}}
+	encodedFeature, err := buildFlatFeature(flatSourceFeature{Feature: feature, Geometry: geometry, FeatureJSON: input}, columns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := buildFlatHeader("empty collection", columns, nil, false, geodata.CRSCRS84, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	writer := gogamafgb.NewFileWriter(&encoded)
+	if _, err := writer.Header(header); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Data([]flat.Feature{encodedFeature}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := decodeFlatGeobuf(&encoded, &output, geodata.OutputCollection); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(sortedFlatFeatures(t, input), sortedFlatFeatures(t, output.Bytes())) {
+		t.Fatalf("empty GeometryCollection decoded as %s", output.Bytes())
+	}
+}
+
 func TestFlatGeobufEmptyCollection(t *testing.T) {
 	input := bytes.NewBufferString(`{"type":"FeatureCollection","features":[]}`)
 	var encoded bytes.Buffer

@@ -217,10 +217,10 @@ func buildFlatHeader(layerName string, columns []flatColumn, features []flatSour
 	var envelopeOffset flatbuffers.UOffsetT
 	geometryType := flat.GeometryTypeUnknown
 	if len(features) > 0 {
-		bounds := features[0].Geometry.Bounds()
+		bounds := extendFlatGeometryBounds(geom.NewBounds(geom.XY), features[0].Geometry)
 		geometryType = flatGeometryType(features[0].Geometry)
 		for _, feature := range features[1:] {
-			bounds.Extend(feature.Geometry)
+			extendFlatGeometryBounds(bounds, feature.Geometry)
 			if flatGeometryType(feature.Geometry) != geometryType {
 				geometryType = flat.GeometryTypeUnknown
 			}
@@ -716,9 +716,31 @@ func flatGeomEnds(geometry *flat.Geometry, positionCount, stride int) ([]int, er
 	return ends, nil
 }
 
+func extendFlatGeometryBounds(bounds *geom.Bounds, geometry geom.T) *geom.Bounds {
+	if collection, ok := geometry.(*geom.GeometryCollection); ok {
+		for index := 0; index < collection.NumGeoms(); index++ {
+			extendFlatGeometryBounds(bounds, collection.Geom(index))
+		}
+		return bounds
+	}
+	return bounds.Extend(geometry)
+}
+
 func equalFlatGeometry(first, second geom.T) bool {
 	if reflect.TypeOf(first) != reflect.TypeOf(second) || first.Stride() != second.Stride() {
 		return false
+	}
+	if firstCollection, ok := first.(*geom.GeometryCollection); ok {
+		secondCollection := second.(*geom.GeometryCollection)
+		if firstCollection.NumGeoms() != secondCollection.NumGeoms() {
+			return false
+		}
+		for index := 0; index < firstCollection.NumGeoms(); index++ {
+			if !equalFlatGeometry(firstCollection.Geom(index), secondCollection.Geom(index)) {
+				return false
+			}
+		}
+		return true
 	}
 	firstCoordinates := first.FlatCoords()
 	secondCoordinates := second.FlatCoords()

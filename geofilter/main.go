@@ -14,6 +14,9 @@ import (
 	"strings"
 
 	"github.com/donomii/geotools/geodata"
+	"github.com/paulmach/orb"
+	"github.com/paulmach/orb/clip"
+	"github.com/paulmach/orb/planar"
 )
 
 var errFilterLimitReached = errors.New("geofilter output limit reached")
@@ -35,10 +38,10 @@ func filterGeoJSON(inputMode geodata.InputMode, outputMode geodata.OutputMode, s
 	if err := writer.Start(); err != nil {
 		return err
 	}
+	if settings.Limit == 0 {
+		return writer.Close()
+	}
 	readErr := geodata.ReadFeatures(input, inputMode, func(feature geodata.Feature) error {
-		if settings.Limit >= 0 && writer.FeatureCount() >= settings.Limit {
-			return errFilterLimitReached
-		}
 		summary, err := geodata.ValidateFeature(feature, geodata.ValidationOptions{AllowNullGeometry: settings.AllowNull})
 		if err != nil {
 			return err
@@ -48,6 +51,15 @@ func filterGeoJSON(inputMode geodata.InputMode, outputMode geodata.OutputMode, s
 		}
 		if settings.HasBBox && (!summary.HasBounds || !boundsIntersect(summary.Bounds, settings.BBox)) {
 			return nil
+		}
+		if settings.HasBBox {
+			geometry, err := geodata.OrbGeometry(feature.Geometry)
+			if err != nil {
+				return fmt.Errorf("failed to decode Feature %s geometry for bbox filtering: %w", feature.EncodedID(), err)
+			}
+			if !geometryIntersectsBBox(geometry, settings.BBox) {
+				return nil
+			}
 		}
 		properties, err := feature.PropertyMap()
 		if err != nil {
@@ -67,7 +79,13 @@ func filterGeoJSON(inputMode geodata.InputMode, outputMode geodata.OutputMode, s
 				return err
 			}
 		}
-		return writer.Write(feature)
+		if err := writer.Write(feature); err != nil {
+			return err
+		}
+		if settings.Limit >= 0 && writer.FeatureCount() >= settings.Limit {
+			return errFilterLimitReached
+		}
+		return nil
 	})
 	if errors.Is(readErr, errFilterLimitReached) {
 		readErr = nil
@@ -161,6 +179,52 @@ func boundsIntersect(first, second [4]float64) bool {
 		return first[2] >= second[0] || first[0] <= second[2]
 	}
 	return first[0] <= second[2] && first[2] >= second[0]
+}
+
+func geometryIntersectsBBox(geometry orb.Geometry, bounds [4]float64) bool {
+	box := orb.Bound{Min: orb.Point{bounds[0], bounds[1]}, Max: orb.Point{bounds[2], bounds[3]}}
+	if bounds[0] <= bounds[2] {
+		return geometryIntersectsBound(geometry, box)
+	}
+	east := orb.Bound{Min: box.Min, Max: orb.Point{180, box.Max[1]}}
+	west := orb.Bound{Min: orb.Point{-180, box.Min[1]}, Max: box.Max}
+	return geometryIntersectsBound(geometry, east) || geometryIntersectsBound(geometry, west)
+}
+
+func geometryIntersectsBound(geometry orb.Geometry, box orb.Bound) bool {
+	if geometry == nil || !box.Intersects(geometry.Bound()) {
+		return false
+	}
+	switch geometry := geometry.(type) {
+	case orb.Point:
+		return box.Contains(geometry)
+	case orb.MultiPoint:
+		return len(clip.MultiPoint(box, geometry)) > 0
+	case orb.LineString:
+		return len(clip.LineString(box, geometry)) > 0
+	case orb.MultiLineString:
+		return len(clip.MultiLineString(box, geometry)) > 0
+	case orb.Polygon:
+		for _, ring := range geometry {
+			if len(clip.LineString(box, orb.LineString(ring))) > 0 {
+				return true
+			}
+		}
+		return len(geometry) > 0 && planar.PolygonContains(geometry, box.Min)
+	case orb.MultiPolygon:
+		for _, polygon := range geometry {
+			if geometryIntersectsBound(polygon, box) {
+				return true
+			}
+		}
+	case orb.Collection:
+		for _, member := range geometry {
+			if geometryIntersectsBound(member, box) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func parseList(value string) (map[string]bool, error) {

@@ -8,17 +8,28 @@ import (
 
 func TestValidateFeatureRejectsInvalidData(t *testing.T) {
 	cases := map[string]string{
-		"null id":        `{"type":"Feature","id":null,"geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`,
-		"missing props":  `{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]}}`,
-		"bad longitude":  `{"type":"Feature","geometry":{"type":"Point","coordinates":[181,2]},"properties":{}}`,
-		"short line":     `{"type":"Feature","geometry":{"type":"LineString","coordinates":[[1,2]]},"properties":{}}`,
-		"open polygon":   `{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1]]]},"properties":{}}`,
-		"unknown shape":  `{"type":"Feature","geometry":{"type":"Circle","coordinates":[1,2]},"properties":{}}`,
-		"bad properties": `{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":[]}`,
-		"bbox dimension": `{"type":"Feature","bbox":[1,2,3,4,5,6],"geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`,
-		"bbox latitude":  `{"type":"Feature","bbox":[1,5,3,4],"geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`,
-		"bbox excludes":  `{"type":"Feature","bbox":[0,0,1,1],"geometry":{"type":"Point","coordinates":[2,2]},"properties":{}}`,
-		"wrapped bbox":   `{"type":"Feature","bbox":[170,-10,-170,10],"geometry":{"type":"Point","coordinates":[0,0]},"properties":{}}`,
+		"null id":                 `{"type":"Feature","id":null,"geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`,
+		"missing props":           `{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]}}`,
+		"bad longitude":           `{"type":"Feature","geometry":{"type":"Point","coordinates":[181,2]},"properties":{}}`,
+		"short line":              `{"type":"Feature","geometry":{"type":"LineString","coordinates":[[1,2]]},"properties":{}}`,
+		"open polygon":            `{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1]]]},"properties":{}}`,
+		"unknown shape":           `{"type":"Feature","geometry":{"type":"Circle","coordinates":[1,2]},"properties":{}}`,
+		"bad properties":          `{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":[]}`,
+		"bbox dimension":          `{"type":"Feature","bbox":[1,2,3,4,5,6],"geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`,
+		"bbox latitude":           `{"type":"Feature","bbox":[1,5,3,4],"geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`,
+		"bbox excludes":           `{"type":"Feature","bbox":[0,0,1,1],"geometry":{"type":"Point","coordinates":[2,2]},"properties":{}}`,
+		"wrapped bbox":            `{"type":"Feature","bbox":[170,-10,-170,10],"geometry":{"type":"Point","coordinates":[0,0]},"properties":{}}`,
+		"null longitude":          `{"type":"Feature","geometry":{"type":"Point","coordinates":[null,1]},"properties":{}}`,
+		"null latitude":           `{"type":"Feature","geometry":{"type":"Point","coordinates":[1,null]},"properties":{}}`,
+		"null altitude":           `{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2,null]},"properties":{}}`,
+		"null bbox value":         `{"type":"Feature","bbox":[null,0,2,2],"geometry":{"type":"Point","coordinates":[1,1]},"properties":{}}`,
+		"geometry bbox type":      `{"type":"Feature","geometry":{"type":"Point","coordinates":[1,1],"bbox":"invalid"},"properties":{}}`,
+		"geometry bbox excludes":  `{"type":"Feature","geometry":{"type":"Point","coordinates":[2,2],"bbox":[0,0,1,1]},"properties":{}}`,
+		"geometry bbox dimension": `{"type":"Feature","geometry":{"type":"Point","coordinates":[1,1,1],"bbox":[0,0,2,2]},"properties":{}}`,
+		"geometry wrapped bbox":   `{"type":"Feature","geometry":{"type":"Point","coordinates":[0,0],"bbox":[170,-10,-170,10]},"properties":{}}`,
+		"nested geometry bbox":    `{"type":"Feature","geometry":{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[1,1],"bbox":"invalid"}]},"properties":{}}`,
+		"nested wrapped bbox":     `{"type":"Feature","geometry":{"type":"GeometryCollection","bbox":[170,-10,-170,10],"geometries":[{"type":"Point","coordinates":[0,0],"bbox":[-10,-10,10,10]}]},"properties":{}}`,
+		"single short multiline":  `{"type":"Feature","geometry":{"type":"MultiLineString","coordinates":[[[0,0]]]},"properties":{}}`,
 	}
 	for name, input := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -92,6 +103,9 @@ func TestValidateHigherDimensionalAndAntimeridianBBoxes(t *testing.T) {
 	for _, input := range []string{
 		`{"type":"Feature","bbox":[1,2,3,4,1,2,3,4],"geometry":{"type":"Point","coordinates":[1,2,3,4]},"properties":{}}`,
 		`{"type":"Feature","bbox":[177,-20,-178,-16],"geometry":{"type":"LineString","coordinates":[[179,-18],[-179,-17]]},"properties":{}}`,
+		`{"type":"Feature","geometry":{"type":"MultiLineString","coordinates":[[[0,0],[1,1]]]},"properties":{}}`,
+		`{"type":"Feature","geometry":{"type":"Point","bbox":[1,2,3,1,2,3],"coordinates":[1,2,3]},"properties":{}}`,
+		`{"type":"Feature","geometry":{"type":"MultiPoint","bbox":[170,-10,-170,10],"coordinates":[[179,0],[-179,0]]},"properties":{}}`,
 	} {
 		var feature Feature
 		if err := json.Unmarshal([]byte(input), &feature); err != nil {

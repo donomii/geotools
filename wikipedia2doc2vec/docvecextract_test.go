@@ -11,6 +11,7 @@ import (
 	"testing"
 	"unicode"
 
+	"github.com/donomii/geotools/wikidump"
 	"github.com/dustin/go-wikiparse"
 )
 
@@ -82,6 +83,22 @@ func TestProcessWikipediaDocumentLimitIsExact(t *testing.T) {
 func TestProcessWikipediaZeroLimitWritesNothing(t *testing.T) {
 	if output := processDocumentDump(t, 0, 2); output != "" {
 		t.Fatalf("zero limit wrote %q", output)
+	}
+}
+
+func TestProcessWikipediaXMLPreamble(t *testing.T) {
+	expected := processDocumentDump(t, -1, 3)
+	input := "\uFEFF<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- Wikipedia export -->\n" + realWikipediaDocumentDump
+	parser, err := wikidump.NewParser(strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := process(parser, &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != expected {
+		t.Fatalf("declared XML output is %q, expected %q", output.String(), expected)
 	}
 }
 
@@ -184,7 +201,7 @@ func TestWriteDocvecResultsReleasesOrderedResultSlots(t *testing.T) {
 }
 
 func TestProcessReportsMalformedDocumentDump(t *testing.T) {
-	parser, err := wikiparse.NewParser(strings.NewReader(strings.TrimSuffix(realWikipediaDocumentDump, "</mediawiki>")))
+	parser, err := wikidump.NewParser(strings.NewReader(strings.TrimSuffix(realWikipediaDocumentDump, "</mediawiki>")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +215,7 @@ func TestProcessReportsMalformedDocumentDump(t *testing.T) {
 
 func processDocumentDump(t *testing.T, pageLimit int64, workers int) string {
 	t.Helper()
-	parser, err := wikiparse.NewParser(strings.NewReader(realWikipediaDocumentDump))
+	parser, err := wikidump.NewParser(strings.NewReader(realWikipediaDocumentDump))
 	if err != nil {
 		t.Fatal(err)
 	}

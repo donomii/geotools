@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -216,6 +217,110 @@ func TestStreamingAPIsRejectInvalidModes(t *testing.T) {
 	writer := NewFeatureWriter(&bytes.Buffer{}, OutputMode("invalid"))
 	if err := writer.Start(); err == nil {
 		t.Fatal("FeatureWriter accepted an invalid output mode")
+	}
+}
+
+func TestFeatureCollectionBBoxContainsEveryPosition(t *testing.T) {
+	tests := []struct {
+		name        string
+		bbox        string
+		coordinates string
+		valid       bool
+	}{
+		{"ordinary", `[0,0,2,2]`, `[[0,0],[2,2]]`, true},
+		{"excludes position", `[0,0,1,1]`, `[[2,2]]`, false},
+		{"dimension mismatch", `[0,0,0,2,2,2]`, `[[1,1]]`, false},
+		{"altitude excluded", `[0,0,0,2,2,2]`, `[[1,1,3]]`, false},
+		{"altitude included", `[0,0,0,2,2,3]`, `[[1,1,3]]`, true},
+		{"null bound", `[null,0,2,2]`, `[[1,1]]`, false},
+		{"wrapped", `[170,-10,-170,10]`, `[[179,0],[-179,0]]`, true},
+		{"wrapped excludes middle", `[170,-10,-170,10]`, `[[-179,0],[0,0],[179,0]]`, false},
+		{"wrapped negative endpoints", `[-10,-10,-20,10]`, `[[-30,0],[-5,0]]`, true},
+		{"wrapped negative gap", `[-10,-10,-20,10]`, `[[-30,0],[-15,0],[-5,0]]`, false},
+		{"wrapped positive gap", `[20,-10,10,10]`, `[[5,0],[15,0],[25,0]]`, false},
+	}
+	for _, test := range tests {
+		feature := `{"type":"Feature","geometry":{"type":"MultiPoint","coordinates":` + test.coordinates + `},"properties":{}}`
+		collections := []string{
+			`{"type":"FeatureCollection","bbox":` + test.bbox + `,"features":[` + feature + `]}`,
+			`{"type":"FeatureCollection","features":[` + feature + `],"bbox":` + test.bbox + `}`,
+			`{"features":[` + feature + `],"bbox":` + test.bbox + `,"type":"FeatureCollection"}`,
+		}
+		for order, collection := range collections {
+			t.Run(fmt.Sprintf("%s/order%d", test.name, order), func(t *testing.T) {
+				err := ReadFeatures(strings.NewReader(collection), InputAuto, func(Feature) error { return nil })
+				if (err == nil) != test.valid {
+					t.Fatalf("collection valid=%t, expected %t: %v; input %s", err == nil, test.valid, err, collection)
+				}
+			})
+		}
+	}
+}
+
+func TestCollectionLongitudeSpillIsBoundedAndCleanedUp(t *testing.T) {
+	tests := []struct {
+		name      string
+		before    string
+		after     string
+		longitude float64
+		stopEarly bool
+		wantSpill bool
+		wantError bool
+	}{
+		{"early bbox", `,"bbox":[170,-10,-170,10]`, ``, 179, false, false, false},
+		{"late bbox", ``, `,"bbox":[170,-10,-170,10]`, 179, false, true, false},
+		{"late bbox rejects retained longitude", ``, `,"bbox":[170,-10,-170,10]`, 0, false, true, true},
+		{"no bbox", ``, ``, 179, false, true, false},
+		{"visitor error", ``, ``, 179, true, true, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			temporaryDirectory := t.TempDir()
+			t.Setenv("TMPDIR", temporaryDirectory)
+			var input strings.Builder
+			input.WriteString(`{"type":"FeatureCollection"` + test.before + `,"features":[`)
+			for index := 0; index <= collectionLongitudeBufferSize; index++ {
+				if index > 0 {
+					input.WriteByte(',')
+				}
+				longitude := 179.0
+				if index == 0 {
+					longitude = test.longitude
+				}
+				fmt.Fprintf(&input, `{"type":"Feature","geometry":{"type":"Point","coordinates":[%g,0]},"properties":{}}`, longitude)
+			}
+			input.WriteString(`]` + test.after + `}`)
+			visited := 0
+			spillSeen := false
+			visitorErr := errors.New("stop after retained coordinates")
+			err := ReadFeatures(strings.NewReader(input.String()), InputAuto, func(Feature) error {
+				visited++
+				if visited == collectionLongitudeBufferSize {
+					files, err := os.ReadDir(temporaryDirectory)
+					if err != nil {
+						return err
+					}
+					spillSeen = len(files) > 0
+					if test.stopEarly {
+						return visitorErr
+					}
+				}
+				return nil
+			})
+			if (err != nil) != test.wantError || (test.stopEarly && !errors.Is(err, visitorErr)) {
+				t.Fatalf("unexpected collection result: %v; expected error=%t", err, test.wantError)
+			}
+			if spillSeen != test.wantSpill {
+				t.Fatalf("temporary longitude storage used=%t, expected %t", spillSeen, test.wantSpill)
+			}
+			files, err := os.ReadDir(temporaryDirectory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(files) != 0 {
+				t.Fatalf("collection validation left temporary files: %v", files)
+			}
+		})
 	}
 }
 

@@ -15,7 +15,7 @@ func TestParseCRSReferences(t *testing.T) {
 		`"EPSG:4326"`: CRSEPSG4326,
 		`{"type":"Reference","href":"https://www.opengis.net/def/crs/EPSG/0/3857"}`: CRSEPSG3857,
 		`{"type":"ProjectedCRS","id":{"authority":"EPSG","code":3857}}`:             CRSEPSG3857,
-		`{"id":{"authority":"EPSG","code":"4979"}}`:                                 CRSCRS84h,
+		`{"id":{"authority":"EPSG","code":"4979"}}`:                                 CRSEPSG4979,
 		`{"type":"ProjectedCRS","id":{"authority":"EPSG","code":32648}}`:            "EPSG:32648",
 		`"https://www.opengis.net/def/crs/EPSG/0/27700"`:                            CRSEPSG27700,
 	}
@@ -135,6 +135,56 @@ func TestTransformJSONFGGeometryUsesEPSG4326AxisOrder(t *testing.T) {
 	}
 	if math.Abs(point.X()-103.8198) > 1e-12 || math.Abs(point.Y()-1.3521) > 1e-12 {
 		t.Fatalf("CRS84 coordinates are %v; expected longitude then latitude", point.FlatCoords())
+	}
+}
+
+func TestEPSG4979KeepsItsIdentityAndAxisOrder(t *testing.T) {
+	uri, err := CRSURI(CRSEPSG4979)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uri != "http://www.opengis.net/def/crs/EPSG/0/4979" {
+		t.Fatalf("EPSG:4979 URI is %q", uri)
+	}
+	for _, crs := range []string{CRSCRS84h, CRSEPSG4979} {
+		metadata, err := GeoParquetCRS(crs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := ParseCRS(metadata)
+		if err != nil || parsed != crs {
+			t.Fatalf("%s metadata resolves to %q with error %v", crs, parsed, err)
+		}
+		var definition struct {
+			CoordinateSystem struct {
+				Axes []struct {
+					Direction string `json:"direction"`
+				} `json:"axis"`
+			} `json:"coordinate_system"`
+		}
+		if err := json.Unmarshal(metadata, &definition); err != nil {
+			t.Fatal(err)
+		}
+		firstDirection := "east"
+		if crs == CRSEPSG4979 {
+			firstDirection = "north"
+		}
+		if len(definition.CoordinateSystem.Axes) != 3 || definition.CoordinateSystem.Axes[0].Direction != firstDirection {
+			t.Fatalf("%s metadata has coordinate axes %v; expected three axes starting %s", crs, definition.CoordinateSystem.Axes, firstDirection)
+		}
+	}
+	point := geom.NewPointFlat(geom.XYZ, []float64{103.8198, 1.3521, 12})
+	if _, err := TransformJSONFGGeometry(point, CRSCRS84h, CRSEPSG4979); err != nil {
+		t.Fatal(err)
+	}
+	if point.X() != 1.3521 || point.Y() != 103.8198 || point.Z() != 12 {
+		t.Fatalf("EPSG:4979 coordinates are %v; expected latitude, longitude, height", point.FlatCoords())
+	}
+	if _, err := TransformJSONFGGeometry(point, CRSEPSG4979, CRSCRS84h); err != nil {
+		t.Fatal(err)
+	}
+	if point.X() != 103.8198 || point.Y() != 1.3521 || point.Z() != 12 {
+		t.Fatalf("CRS84h coordinates are %v; expected longitude, latitude, height", point.FlatCoords())
 	}
 }
 
