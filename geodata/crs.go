@@ -16,6 +16,7 @@ const (
 	CRSCRS84     = "OGC:CRS84"
 	CRSCRS84h    = "OGC:CRS84h"
 	CRSEPSG4326  = "EPSG:4326"
+	CRSEPSG4979  = "EPSG:4979"
 	CRSEPSG3857  = "EPSG:3857"
 	CRSEPSG3395  = "EPSG:3395"
 	CRSEPSG27700 = "EPSG:27700"
@@ -34,6 +35,8 @@ const projJSONEPSG4326 = `{"$schema":"https://proj.org/schemas/v0.7/projjson.sch
 const projJSONEPSG4979 = `{"$schema":"https://proj.org/schemas/v0.7/projjson.schema.json","type":"GeographicCRS","name":"WGS 84",` + projJSONWGS84Datum + `,"coordinate_system":{"subtype":"ellipsoidal","axis":[{"name":"Geodetic latitude","abbreviation":"Lat","direction":"north","unit":"degree"},{"name":"Geodetic longitude","abbreviation":"Lon","direction":"east","unit":"degree"},{"name":"Ellipsoidal height","abbreviation":"h","direction":"up","unit":"metre"}]},"scope":"Geodesy. Navigation and positioning using GPS satellite system.","area":"World.","bbox":{"south_latitude":-90,"west_longitude":-180,"north_latitude":90,"east_longitude":180},"id":{"authority":"EPSG","code":4979}}`
 
 const projJSONEPSG3857 = `{"$schema":"https://proj.org/schemas/v0.7/projjson.schema.json","type":"ProjectedCRS","name":"WGS 84 / Pseudo-Mercator","base_crs":{"type":"GeographicCRS","name":"WGS 84",` + projJSONWGS84Datum + `,"coordinate_system":{"subtype":"ellipsoidal","axis":[{"name":"Geodetic latitude","abbreviation":"Lat","direction":"north","unit":"degree"},{"name":"Geodetic longitude","abbreviation":"Lon","direction":"east","unit":"degree"}]},"id":{"authority":"EPSG","code":4326}},"conversion":{"name":"Popular Visualisation Pseudo-Mercator","method":{"name":"Popular Visualisation Pseudo Mercator","id":{"authority":"EPSG","code":1024}},"parameters":[{"name":"Latitude of natural origin","value":0,"unit":"degree","id":{"authority":"EPSG","code":8801}},{"name":"Longitude of natural origin","value":0,"unit":"degree","id":{"authority":"EPSG","code":8802}},{"name":"False easting","value":0,"unit":"metre","id":{"authority":"EPSG","code":8806}},{"name":"False northing","value":0,"unit":"metre","id":{"authority":"EPSG","code":8807}}]},"coordinate_system":{"subtype":"Cartesian","axis":[{"name":"Easting","abbreviation":"X","direction":"east","unit":"metre"},{"name":"Northing","abbreviation":"Y","direction":"north","unit":"metre"}]},"scope":"Web mapping and visualisation.","area":"World between 85.06°S and 85.06°N.","bbox":{"south_latitude":-85.06,"west_longitude":-180,"north_latitude":85.06,"east_longitude":180},"id":{"authority":"EPSG","code":3857}}`
+
+const projJSONCRS84h = `{"$schema":"https://proj.org/schemas/v0.7/projjson.schema.json","type":"GeographicCRS","name":"WGS 84 (CRS84h)",` + projJSONWGS84Datum + `,"coordinate_system":{"subtype":"ellipsoidal","axis":[{"name":"Geodetic longitude","abbreviation":"Lon","direction":"east","unit":"degree"},{"name":"Geodetic latitude","abbreviation":"Lat","direction":"north","unit":"degree"},{"name":"Ellipsoidal height","abbreviation":"h","direction":"up","unit":"metre"}]},"id":{"authority":"OGC","code":"CRS84h"}}`
 
 func ParseCRS(raw json.RawMessage) (string, error) {
 	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
@@ -86,10 +89,12 @@ func NormalizeCRS(value string) (string, error) {
 	switch upper {
 	case "OGC:CRS84":
 		return CRSCRS84, nil
-	case "OGC:CRS84H", "EPSG:4979":
+	case "OGC:CRS84H":
 		return CRSCRS84h, nil
 	case "EPSG:4326":
 		return CRSEPSG4326, nil
+	case "EPSG:4979":
+		return CRSEPSG4979, nil
 	case "EPSG:3857":
 		return CRSEPSG3857, nil
 	}
@@ -157,6 +162,8 @@ func GeoParquetCRS(crs string) (json.RawMessage, error) {
 	}
 	switch normalized {
 	case CRSCRS84h:
+		return json.RawMessage(projJSONCRS84h), nil
+	case CRSEPSG4979:
 		return json.RawMessage(projJSONEPSG4979), nil
 	case CRSEPSG4326:
 		return json.RawMessage(projJSONEPSG4326), nil
@@ -243,13 +250,13 @@ func TransformGeometryWithCRSAxisOrder(geometry geom.T, sourceCRS, targetCRS str
 	if err != nil {
 		return nil, err
 	}
-	if source == CRSEPSG4326 {
+	if source == CRSEPSG4326 || source == CRSEPSG4979 {
 		if _, err := swapGeometryXY(geometry); err != nil {
 			return nil, err
 		}
 		source = CRSCRS84
 	}
-	swapTarget := target == CRSEPSG4326
+	swapTarget := target == CRSEPSG4326 || target == CRSEPSG4979
 	if swapTarget {
 		target = CRSCRS84
 	}
@@ -277,8 +284,8 @@ func swapGeometryXY(geometry geom.T) (geom.T, error) {
 }
 
 func equivalentGeographicCRS(first, second string) bool {
-	firstGeographic := first == CRSCRS84 || first == CRSCRS84h || first == CRSEPSG4326
-	secondGeographic := second == CRSCRS84 || second == CRSCRS84h || second == CRSEPSG4326
+	firstGeographic := first == CRSCRS84 || first == CRSCRS84h || first == CRSEPSG4326 || first == CRSEPSG4979
+	secondGeographic := second == CRSCRS84 || second == CRSCRS84h || second == CRSEPSG4326 || second == CRSEPSG4979
 	return firstGeographic && secondGeographic
 }
 
@@ -286,7 +293,7 @@ func projectedCoordinateToWGS84(x, y float64, crs string) (float64, float64, err
 	if !isFiniteCoordinate(x, y) {
 		return 0, 0, fmt.Errorf("coordinate [%v,%v] is not finite", x, y)
 	}
-	if crs == CRSCRS84 || crs == CRSCRS84h || crs == CRSEPSG4326 {
+	if crs == CRSCRS84 || crs == CRSCRS84h || crs == CRSEPSG4326 || crs == CRSEPSG4979 {
 		return x, y, nil
 	}
 	switch crs {
@@ -317,7 +324,7 @@ func wgs84ToProjectedCoordinate(longitude, latitude float64, crs string) (float6
 	if longitude < -180 || longitude > 180 {
 		return 0, 0, fmt.Errorf("longitude %v is outside -180 through 180", longitude)
 	}
-	if crs == CRSCRS84 || crs == CRSCRS84h || crs == CRSEPSG4326 {
+	if crs == CRSCRS84 || crs == CRSCRS84h || crs == CRSEPSG4326 || crs == CRSEPSG4979 {
 		return longitude, latitude, nil
 	}
 	switch crs {

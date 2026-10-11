@@ -646,9 +646,9 @@ func validateJSONFGFeature(feature geodata.Feature, rootCRS string, declarations
 	if err != nil {
 		return fmt.Errorf("place geometry failed validation: %w", err)
 	}
-	if placeCRS == geodata.CRSEPSG4326 && summary.HasBounds &&
+	if (placeCRS == geodata.CRSEPSG4326 || placeCRS == geodata.CRSEPSG4979) && summary.HasBounds &&
 		(summary.Bounds[0] < -90 || summary.Bounds[2] > 90 || summary.Bounds[1] < -180 || summary.Bounds[3] > 180) {
-		return fmt.Errorf("place geometry EPSG:4326 bounds are latitude %v..%v and longitude %v..%v; expected latitude -90..90 and longitude -180..180", summary.Bounds[0], summary.Bounds[2], summary.Bounds[1], summary.Bounds[3])
+		return fmt.Errorf("place geometry %s bounds are latitude %v..%v and longitude %v..%v; expected latitude -90..90 and longitude -180..180", placeCRS, summary.Bounds[0], summary.Bounds[2], summary.Bounds[1], summary.Bounds[3])
 	}
 	return nil
 }

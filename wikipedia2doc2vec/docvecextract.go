@@ -21,6 +21,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/donomii/geotools/wikidump"
 	"github.com/dustin/go-humanize"
 	"github.com/dustin/go-wikiparse"
 )
@@ -302,7 +303,7 @@ func processSingleStream(filename string) error {
 	if err != nil {
 		return err
 	}
-	p, err := wikiparse.NewParser(input)
+	p, err := wikidump.NewParser(input)
 	if err != nil {
 		return errors.Join(fmt.Errorf("failed to set up Wikipedia parser for %q: %w", filename, err), input.Close())
 	}
@@ -310,7 +311,7 @@ func processSingleStream(filename string) error {
 }
 
 func processMultiStream(idx, data string) error {
-	p, err := wikiparse.NewIndexedParser(idx, data, runtime.GOMAXPROCS(0))
+	p, err := wikidump.NewIndexedParser(idx, data, runtime.GOMAXPROCS(0))
 	if err != nil {
 		return fmt.Errorf("failed to initialize Wikipedia multistream parser for index %q and data %q: %w", idx, data, err)
 	}

@@ -9,11 +9,13 @@ import (
 )
 
 type ValidationOptions struct {
-	AllowNullGeometry bool
-	AllowOutOfRange   bool
-	wrappedLongitude  bool
-	westLongitude     float64
-	eastLongitude     float64
+	AllowNullGeometry       bool
+	AllowOutOfRange         bool
+	wrappedLongitude        bool
+	westLongitude           float64
+	eastLongitude           float64
+	geometryLongitudeBounds [][2]float64
+	visitLongitude          func(float64) error
 }
 
 type GeometrySummary struct {
@@ -29,6 +31,7 @@ type GeometrySummary struct {
 
 type geometryObject struct {
 	Type        string            `json:"type"`
+	BBox        json.RawMessage   `json:"bbox"`
 	Coordinates json.RawMessage   `json:"coordinates"`
 	Geometries  []json.RawMessage `json:"geometries"`
 }
@@ -74,20 +77,30 @@ func ValidateFeature(feature Feature, options ValidationOptions) (GeometrySummar
 	if summary.mixedDimensions {
 		return GeometrySummary{}, fmt.Errorf("Feature %s geometry mixes positions with different coordinate dimensions", feature.EncodedID())
 	}
-	if bboxDimension != 0 && bboxDimension != summary.CoordinateDimension {
-		return GeometrySummary{}, fmt.Errorf("Feature %s bbox describes %d dimensions but geometry positions contain %d coordinates", feature.EncodedID(), bboxDimension, summary.CoordinateDimension)
-	}
-	for dimension := 0; dimension < bboxDimension; dimension++ {
-		if dimension == 0 && bboxValues[0] > bboxValues[bboxDimension] {
-			continue
-		}
-		if bboxValues[dimension] > summary.minimums[dimension] || bboxValues[bboxDimension+dimension] < summary.maximums[dimension] {
-			return GeometrySummary{}, fmt.Errorf("Feature %s bbox range %v..%v for dimension %d does not contain geometry range %v..%v",
-				feature.EncodedID(), bboxValues[dimension], bboxValues[bboxDimension+dimension], dimension+1,
-				summary.minimums[dimension], summary.maximums[dimension])
-		}
+	if err := validateSummaryBBox(summary, bboxDimension, bboxValues); err != nil {
+		return GeometrySummary{}, fmt.Errorf("Feature %s bbox is invalid: %w", feature.EncodedID(), err)
 	}
 	return summary, nil
+}
+
+func validateSummaryBBox(summary GeometrySummary, dimension int, values []float64) error {
+	if dimension == 0 {
+		return nil
+	}
+	if dimension != summary.CoordinateDimension || summary.mixedDimensions {
+		return fmt.Errorf("bbox describes %d dimensions but geometry positions contain %d coordinates (mixed dimensions: %t)",
+			dimension, summary.CoordinateDimension, summary.mixedDimensions)
+	}
+	for axis := 0; axis < dimension; axis++ {
+		if axis == 0 && values[0] > values[dimension] {
+			continue
+		}
+		if values[axis] > summary.minimums[axis] || values[dimension+axis] < summary.maximums[axis] {
+			return fmt.Errorf("bbox range %v..%v for dimension %d does not contain geometry range %v..%v",
+				values[axis], values[dimension+axis], axis+1, summary.minimums[axis], summary.maximums[axis])
+		}
+	}
+	return nil
 }
 
 func validFeatureID(raw json.RawMessage) bool {
@@ -112,9 +125,9 @@ func validateBBox(raw json.RawMessage) (int, []float64, error) {
 	if raw == nil {
 		return 0, nil, nil
 	}
-	var values []float64
-	if err := json.Unmarshal(raw, &values); err != nil {
-		return 0, nil, fmt.Errorf("expected an array of numbers: %w", err)
+	values, err := decodeCoordinateValues(raw)
+	if err != nil {
+		return 0, nil, err
 	}
 	if len(values) < 4 || len(values)%2 != 0 {
 		return 0, nil, fmt.Errorf("contains %d values; expected two values for each of at least two coordinate dimensions", len(values))
@@ -138,6 +151,24 @@ func inspectGeometry(raw json.RawMessage, options ValidationOptions, path string
 	if err := json.Unmarshal(raw, &geometry); err != nil {
 		return GeometrySummary{}, fmt.Errorf("%s is not an object: %w", path, err)
 	}
+	bboxDimension, bboxValues, err := validateBBox(geometry.BBox)
+	if err != nil {
+		return GeometrySummary{}, fmt.Errorf("%s.bbox is invalid: %w", path, err)
+	}
+	if bboxDimension != 0 && bboxValues[0] > bboxValues[bboxDimension] {
+		options.geometryLongitudeBounds = append(options.geometryLongitudeBounds, [2]float64{bboxValues[0], bboxValues[bboxDimension]})
+	}
+	summary, err := inspectGeometryCoordinates(geometry, options, path)
+	if err != nil {
+		return GeometrySummary{}, err
+	}
+	if err := validateSummaryBBox(summary, bboxDimension, bboxValues); err != nil {
+		return GeometrySummary{}, fmt.Errorf("%s.bbox is invalid: %w", path, err)
+	}
+	return summary, nil
+}
+
+func inspectGeometryCoordinates(geometry geometryObject, options ValidationOptions, path string) (GeometrySummary, error) {
 	if geometry.Type == "" {
 		return GeometrySummary{}, fmt.Errorf("%s is missing type", path)
 	}
@@ -203,7 +234,7 @@ func inspectPositionArray(raw json.RawMessage, path string, depth, minimumLength
 	if err := json.Unmarshal(raw, &values); err != nil {
 		return fmt.Errorf("%s must be an array: %w", path, err)
 	}
-	if minimumLength > 0 && len(values) < minimumLength {
+	if depth == 1 && minimumLength > 0 && len(values) < minimumLength {
 		return fmt.Errorf("%s contains %d positions; expected at least %d", path, len(values), minimumLength)
 	}
 	for index, value := range values {
@@ -258,8 +289,8 @@ func inspectPolygon(raw json.RawMessage, path string, options ValidationOptions,
 }
 
 func decodePosition(raw json.RawMessage, path string, options ValidationOptions) ([]float64, error) {
-	var position []float64
-	if err := json.Unmarshal(raw, &position); err != nil {
+	position, err := decodeCoordinateValues(raw)
+	if err != nil {
 		return nil, fmt.Errorf("%s must be an array of numbers: %w", path, err)
 	}
 	if len(position) < 2 {
@@ -281,7 +312,37 @@ func decodePosition(raw json.RawMessage, path string, options ValidationOptions)
 	if options.wrappedLongitude && position[0] < options.westLongitude && position[0] > options.eastLongitude {
 		return nil, fmt.Errorf("%s longitude is %v; wrapped bbox contains %v through 180 or -180 through %v", path, position[0], options.westLongitude, options.eastLongitude)
 	}
+	for _, bounds := range options.geometryLongitudeBounds {
+		if position[0] < bounds[0] && position[0] > bounds[1] {
+			return nil, fmt.Errorf("%s longitude is %v; wrapped geometry bbox contains %v through 180 or -180 through %v", path, position[0], bounds[0], bounds[1])
+		}
+	}
+	if options.visitLongitude != nil {
+		if err := options.visitLongitude(position[0]); err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+	}
 	return position, nil
+}
+
+func decodeCoordinateValues(raw json.RawMessage) ([]float64, error) {
+	var values []json.RawMessage
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil, fmt.Errorf("expected an array of numbers: %w", err)
+	}
+	if values == nil {
+		return nil, fmt.Errorf("expected an array of numbers, received %s", raw)
+	}
+	coordinates := make([]float64, len(values))
+	for index, value := range values {
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return nil, fmt.Errorf("coordinate %d is null; expected a finite number", index+1)
+		}
+		if err := json.Unmarshal(value, &coordinates[index]); err != nil {
+			return nil, fmt.Errorf("coordinate %d is %s; expected a number: %w", index+1, value, err)
+		}
+	}
+	return coordinates, nil
 }
 
 func positionsEqual(first, second []float64) bool {

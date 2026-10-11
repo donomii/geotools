@@ -12,6 +12,72 @@ import (
 	"testing"
 )
 
+func TestOSMMultipolygonAssignsHolesToClosestOuter(t *testing.T) {
+	land := [][]float64{{0, 0}, {10, 0}, {10, 10}, {0, 10}, {0, 0}}
+	lake := [][]float64{{1, 1}, {9, 1}, {9, 9}, {1, 9}, {1, 1}}
+	island := [][]float64{{2, 2}, {8, 2}, {8, 8}, {2, 8}, {2, 2}}
+	pond := [][]float64{{3, 3}, {7, 3}, {7, 7}, {3, 7}, {3, 3}}
+	tests := []struct {
+		name  string
+		rings []osmRelationSegment
+	}{
+		{"land first", []osmRelationSegment{{Role: "outer", Coordinates: land}, {Role: "inner", Coordinates: lake}, {Role: "outer", Coordinates: island}, {Role: "inner", Coordinates: pond}}},
+		{"island first", []osmRelationSegment{{Role: "inner", Coordinates: pond}, {Role: "outer", Coordinates: island}, {Role: "inner", Coordinates: lake}, {Role: "outer", Coordinates: land}}},
+		{"pond before lake", []osmRelationSegment{{Role: "outer", Coordinates: land}, {Role: "inner", Coordinates: pond}, {Role: "outer", Coordinates: island}, {Role: "inner", Coordinates: lake}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			geometry, err := osmMultipolygonGeometry(test.rings)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var polygons [][][][]float64
+			if err := json.Unmarshal(geometry.Coordinates, &polygons); err != nil {
+				t.Fatal(err)
+			}
+			if geometry.Type != "MultiPolygon" || len(polygons) != 2 {
+				t.Fatalf("expected land and island polygons; got %s %s", geometry.Type, geometry.Coordinates)
+			}
+			for _, polygon := range polygons {
+				if len(polygon) != 2 {
+					t.Fatalf("polygon has %d rings; expected its outer and one hole: %v", len(polygon), polygon)
+				}
+				expectedHoleArea := map[float64]float64{100: -64, 36: -16}[osmRingSignedArea(polygon[0])]
+				if expectedHoleArea == 0 || osmRingSignedArea(polygon[1]) != expectedHoleArea {
+					t.Fatalf("outer area %v has hole area %v; expected %v", osmRingSignedArea(polygon[0]), osmRingSignedArea(polygon[1]), expectedHoleArea)
+				}
+			}
+		})
+	}
+}
+
+func TestOSMMultipolygonRejectsPartiallyContainedHole(t *testing.T) {
+	_, err := osmMultipolygonGeometry([]osmRelationSegment{
+		{Role: "outer", Coordinates: [][]float64{{0, 0}, {10, 0}, {10, 10}, {0, 10}, {0, 0}}},
+		{Role: "inner", Coordinates: [][]float64{{5, 5}, {15, 5}, {15, 15}, {5, 15}, {5, 5}}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "inner ring is not contained by an outer ring") {
+		t.Fatalf("expected uncontained hole error, got %v", err)
+	}
+}
+
+func TestOSMMultipolygonAllowsHoleTouchingOuterAtVertex(t *testing.T) {
+	geometry, err := osmMultipolygonGeometry([]osmRelationSegment{
+		{Role: "outer", Coordinates: [][]float64{{0, 0}, {10, 0}, {10, 10}, {0, 10}, {0, 0}}},
+		{Role: "inner", Coordinates: [][]float64{{10, 5}, {8, 6}, {8, 4}, {10, 5}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rings [][][]float64
+	if err := json.Unmarshal(geometry.Coordinates, &rings); err != nil {
+		t.Fatal(err)
+	}
+	if len(rings) != 2 {
+		t.Fatalf("expected outer and touching hole, got %s", geometry.Coordinates)
+	}
+}
+
 const realVancouverOSM = `<?xml version="1.0" encoding="UTF-8"?>
 <osm version="0.6" generator="geotools-test">
   <node id="971076208" lat="49.2682544" lon="-123.2548774">

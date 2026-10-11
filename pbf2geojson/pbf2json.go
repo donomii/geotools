@@ -756,17 +756,19 @@ func multipolygonGeometry(ways []relationWay) (geoJSONGeometry, error) {
 	}
 	for _, inner := range innerRings {
 		inner = normalizeRing(inner, true)
-		assigned := false
+		parent := -1
+		parentArea := math.Inf(1)
 		for outerIndex, outer := range outerRings {
-			if pointInRing(inner[0], outer) {
-				polygons[outerIndex] = append(polygons[outerIndex], inner)
-				assigned = true
-				break
+			area := math.Abs(ringSignedArea(outer))
+			if area < parentArea && ringContainsRing(outer, inner) {
+				parent = outerIndex
+				parentArea = area
 			}
 		}
-		if !assigned {
+		if parent < 0 {
 			return geoJSONGeometry{}, fmt.Errorf("inner ring is not contained by an outer ring")
 		}
+		polygons[parent] = append(polygons[parent], inner)
 	}
 
 	if len(polygons) == 1 {
@@ -889,6 +891,13 @@ func pointInRing(point []float64, ring [][]float64) bool {
 	for current, previous := 0, len(ring)-1; current < len(ring); previous, current = current, current+1 {
 		currentPoint := ring[current]
 		previousPoint := ring[previous]
+		cross := (point[0]-previousPoint[0])*(currentPoint[1]-previousPoint[1]) -
+			(point[1]-previousPoint[1])*(currentPoint[0]-previousPoint[0])
+		onLongitude := point[0] >= math.Min(previousPoint[0], currentPoint[0]) && point[0] <= math.Max(previousPoint[0], currentPoint[0])
+		onLatitude := point[1] >= math.Min(previousPoint[1], currentPoint[1]) && point[1] <= math.Max(previousPoint[1], currentPoint[1])
+		if cross == 0 && onLongitude && onLatitude {
+			return true
+		}
 		crossesLatitude := (currentPoint[1] > point[1]) != (previousPoint[1] > point[1])
 		if crossesLatitude {
 			crossingLongitude := (previousPoint[0]-currentPoint[0])*(point[1]-currentPoint[1])/(previousPoint[1]-currentPoint[1]) + currentPoint[0]
@@ -898,6 +907,15 @@ func pointInRing(point []float64, ring [][]float64) bool {
 		}
 	}
 	return inside
+}
+
+func ringContainsRing(outer, inner [][]float64) bool {
+	for _, point := range inner {
+		if !pointInRing(point, outer) {
+			return false
+		}
+	}
+	return true
 }
 
 func geometryBounds(ways []relationWay, cache pbfFeatureCache, nodeIDs []int64) ([]float64, error) {

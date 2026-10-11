@@ -25,7 +25,7 @@ func jsonFGMeasuresEnabled(raw json.RawMessage) (bool, error) {
 }
 
 func jsonFGCRSDimension(crs string) int {
-	if crs == geodata.CRSCRS84h {
+	if crs == geodata.CRSCRS84h || crs == geodata.CRSEPSG4979 {
 		return 3
 	}
 	return 2

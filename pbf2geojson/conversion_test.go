@@ -16,6 +16,72 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+func TestPBFMultipolygonAssignsHolesToClosestOuter(t *testing.T) {
+	land := [][]float64{{0, 0}, {10, 0}, {10, 10}, {0, 10}, {0, 0}}
+	lake := [][]float64{{1, 1}, {9, 1}, {9, 9}, {1, 9}, {1, 1}}
+	island := [][]float64{{2, 2}, {8, 2}, {8, 8}, {2, 8}, {2, 2}}
+	pond := [][]float64{{3, 3}, {7, 3}, {7, 7}, {3, 7}, {3, 3}}
+	tests := []struct {
+		name  string
+		rings []relationWay
+	}{
+		{"land first", []relationWay{{Role: "outer", Coordinates: land}, {Role: "inner", Coordinates: lake}, {Role: "outer", Coordinates: island}, {Role: "inner", Coordinates: pond}}},
+		{"island first", []relationWay{{Role: "inner", Coordinates: pond}, {Role: "outer", Coordinates: island}, {Role: "inner", Coordinates: lake}, {Role: "outer", Coordinates: land}}},
+		{"pond before lake", []relationWay{{Role: "outer", Coordinates: land}, {Role: "inner", Coordinates: pond}, {Role: "outer", Coordinates: island}, {Role: "inner", Coordinates: lake}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			geometry, err := multipolygonGeometry(test.rings)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var polygons [][][][]float64
+			if err := json.Unmarshal(geometry.Coordinates, &polygons); err != nil {
+				t.Fatal(err)
+			}
+			if geometry.Type != "MultiPolygon" || len(polygons) != 2 {
+				t.Fatalf("expected land and island polygons; got %s %s", geometry.Type, geometry.Coordinates)
+			}
+			for _, polygon := range polygons {
+				if len(polygon) != 2 {
+					t.Fatalf("polygon has %d rings; expected its outer and one hole: %v", len(polygon), polygon)
+				}
+				expectedHoleArea := map[float64]float64{100: -64, 36: -16}[ringSignedArea(polygon[0])]
+				if expectedHoleArea == 0 || ringSignedArea(polygon[1]) != expectedHoleArea {
+					t.Fatalf("outer area %v has hole area %v; expected %v", ringSignedArea(polygon[0]), ringSignedArea(polygon[1]), expectedHoleArea)
+				}
+			}
+		})
+	}
+}
+
+func TestPBFMultipolygonRejectsPartiallyContainedHole(t *testing.T) {
+	_, err := multipolygonGeometry([]relationWay{
+		{Role: "outer", Coordinates: [][]float64{{0, 0}, {10, 0}, {10, 10}, {0, 10}, {0, 0}}},
+		{Role: "inner", Coordinates: [][]float64{{5, 5}, {15, 5}, {15, 15}, {5, 15}, {5, 5}}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "inner ring is not contained by an outer ring") {
+		t.Fatalf("expected uncontained hole error, got %v", err)
+	}
+}
+
+func TestPBFMultipolygonAllowsHoleTouchingOuterAtVertex(t *testing.T) {
+	geometry, err := multipolygonGeometry([]relationWay{
+		{Role: "outer", Coordinates: [][]float64{{0, 0}, {10, 0}, {10, 10}, {0, 10}, {0, 0}}},
+		{Role: "inner", Coordinates: [][]float64{{10, 5}, {8, 6}, {8, 4}, {10, 5}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rings [][][]float64
+	if err := json.Unmarshal(geometry.Coordinates, &rings); err != nil {
+		t.Fatal(err)
+	}
+	if len(rings) != 2 {
+		t.Fatalf("expected outer and touching hole, got %s", geometry.Coordinates)
+	}
+}
+
 func TestConvertRealVancouverPBFData(t *testing.T) {
 	output := convertPBFForTest(t, "building", false, false)
 	features := decodePBFJSONL(t, output)

@@ -117,7 +117,7 @@ func sortFlatFeaturesForIndex(sourceFeatures []flatSourceFeature, encodedFeature
 	refs := make([]packedrtree.Ref, len(sourceFeatures))
 	allBounds := packedrtree.EmptyBox
 	for index, source := range sourceFeatures {
-		bounds := source.Geometry.Bounds()
+		bounds := extendFlatGeometryBounds(geom.NewBounds(geom.XY), source.Geometry)
 		refs[index] = packedrtree.Ref{
 			Box: packedrtree.Box{
 				XMin: bounds.Min(0),
@@ -401,7 +401,7 @@ func flatIndexSearchBox(bbox [4]float64, sourceCRS string) (packedrtree.Box, boo
 	if _, err := geodata.TransformGeometry(geometry, geodata.CRSCRS84, sourceCRS); err != nil {
 		return packedrtree.Box{}, false
 	}
-	bounds := geometry.Bounds()
+	bounds := extendFlatGeometryBounds(geom.NewBounds(geom.XY), geometry)
 	xPadding := math.Max(1, bounds.Max(0)-bounds.Min(0)) * 1e-7
 	yPadding := math.Max(1, bounds.Max(1)-bounds.Min(1)) * 1e-7
 	return packedrtree.Box{

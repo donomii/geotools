@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"sort"
 	"strconv"
 	"strings"
@@ -541,22 +542,30 @@ func inferGeoParquetPropertyKind(raw json.RawMessage) (geoParquetPropertyKind, b
 			if _, err := number.Int64(); err == nil {
 				return geoParquetPropertyInt, true, nil
 			}
+			return geoParquetPropertyJSON, true, nil
 		}
 		converted, err := number.Float64()
-		if err != nil || math.IsNaN(converted) || math.IsInf(converted, 0) {
+		if err != nil || math.IsNaN(converted) || math.IsInf(converted, 0) || !geoParquetDoublePreservesNumber(value, converted) {
 			return geoParquetPropertyJSON, true, nil
 		}
 		return geoParquetPropertyDouble, true, nil
 	}
 }
 
+func geoParquetDoublePreservesNumber(value []byte, converted float64) bool {
+	text := string(value)
+	if converted == 0 {
+		mantissa := strings.SplitN(strings.ToLower(text), "e", 2)[0]
+		return !strings.ContainsAny(mantissa, "123456789")
+	}
+	original, originalOK := new(big.Rat).SetString(text)
+	roundTrip, roundTripOK := new(big.Rat).SetString(strconv.FormatFloat(converted, 'g', -1, 64))
+	return originalOK && roundTripOK && original.Cmp(roundTrip) == 0
+}
+
 func promoteGeoParquetPropertyKind(first, second geoParquetPropertyKind) geoParquetPropertyKind {
 	if first == geoParquetPropertyUnknown || first == second {
 		return second
-	}
-	if (first == geoParquetPropertyInt && second == geoParquetPropertyDouble) ||
-		(first == geoParquetPropertyDouble && second == geoParquetPropertyInt) {
-		return geoParquetPropertyDouble
 	}
 	return geoParquetPropertyJSON
 }

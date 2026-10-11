@@ -179,9 +179,17 @@ func visitJSONToken(decoder *json.Decoder, token json.Token, visit FeatureVisito
 	}
 }
 
-func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor, allowCollection bool) error {
+func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor, allowCollection bool) (resultErr error) {
 	members := make(map[string]json.RawMessage)
 	seen := make(map[string]bool)
+	var bounds collectionBounds
+	defer func() { resultErr = errors.Join(resultErr, bounds.close()) }()
+	visitCollectionFeature := func(feature Feature) error {
+		if err := bounds.add(feature); err != nil {
+			return err
+		}
+		return visit(feature)
+	}
 	featuresSeen := false
 	featuresStreamed := false
 	var deferredFeatures json.RawMessage
@@ -204,7 +212,10 @@ func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor, allowCollectio
 			}
 			featuresSeen = true
 			featuresStreamed = true
-			if err := visitFeatureArray(decoder, visit); err != nil {
+			if err := bounds.setBBox(members["bbox"]); err != nil {
+				return err
+			}
+			if err := visitFeatureArray(decoder, visitCollectionFeature); err != nil {
 				return err
 			}
 		} else {
@@ -245,17 +256,15 @@ func visitJSONObject(decoder *json.Decoder, visit FeatureVisitor, allowCollectio
 		if !featuresSeen {
 			return fmt.Errorf("FeatureCollection is missing features")
 		}
-		if bbox := members["bbox"]; bbox != nil {
-			if _, _, err := validateBBox(bbox); err != nil {
-				return fmt.Errorf("FeatureCollection bbox is invalid: %w", err)
-			}
-		}
 		if !featuresStreamed {
-			if err := visitDeferredFeatureArray(deferredFeatures, visit); err != nil {
+			if err := bounds.setBBox(members["bbox"]); err != nil {
+				return err
+			}
+			if err := visitDeferredFeatureArray(deferredFeatures, visitCollectionFeature); err != nil {
 				return err
 			}
 		}
-		return nil
+		return bounds.finish(members["bbox"])
 	}
 	if featuresSeen {
 		members["features"] = deferredFeatures
