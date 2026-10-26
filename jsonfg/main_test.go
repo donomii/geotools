@@ -215,6 +215,54 @@ func TestJSONFGEPSG4326AxisOrderRoundTrip(t *testing.T) {
 	}
 }
 
+func TestJSONFGEPSG4979AxisOrderRoundTrip(t *testing.T) {
+	input := []byte(`{"type":"Feature","geometry":{"type":"Point","coordinates":[103.8198,1.3521,12]},"properties":{}}`)
+	settings := jsonFGSettings{PlaceCRS: geodata.CRSEPSG4979}
+	var encoded bytes.Buffer
+	if err := encodeJSONFGWithSettings(bytes.NewReader(input), &encoded, geodata.InputAuto, settings); err != nil {
+		t.Fatal(err)
+	}
+	var root jsonFGRoot
+	if err := json.Unmarshal(encoded.Bytes(), &root); err != nil {
+		t.Fatal(err)
+	}
+	var feature geodata.Feature
+	if err := json.Unmarshal(root.Features[0], &feature); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(feature.Foreign["place"], []byte(`[1.3521,103.8198,12]`)) {
+		t.Fatalf("EPSG:4979 place coordinates are %s; expected latitude, longitude, height", feature.Foreign["place"])
+	}
+	feature.Geometry = json.RawMessage("null")
+	var err error
+	root.Features[0], err = json.Marshal(feature)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded.Reset()
+	if err := json.NewEncoder(&encoded).Encode(root); err != nil {
+		t.Fatal(err)
+	}
+	var decoded bytes.Buffer
+	if err := decodeJSONFGWithSettings(&encoded, &decoded, geodata.OutputCollection, settings); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(jsonFGFeatures(t, input), jsonFGFeatures(t, decoded.Bytes())) {
+		t.Fatalf("EPSG:4979 round trip changed Feature content: %s", decoded.Bytes())
+	}
+}
+
+func TestJSONFGDecodesEPSG4979Place(t *testing.T) {
+	input := bytes.NewBufferString(`{"type":"Feature","conformsTo":["http://www.opengis.net/spec/json-fg-1/1.0/conf/core"],"coordRefSys":"http://www.opengis.net/def/crs/EPSG/0/4979","geometry":null,"place":{"type":"Point","coordinates":[1.3521,103.8198,12]},"properties":{}}`)
+	var decoded bytes.Buffer
+	if err := decodeJSONFG(input, &decoded, geodata.OutputCollection); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(decoded.Bytes(), []byte(`[103.8198,1.3521,12]`)) {
+		t.Fatalf("EPSG:4979 place decoded as %s", decoded.Bytes())
+	}
+}
+
 func TestJSONFGMeasuresAndTypeSchemaRoundTrip(t *testing.T) {
 	input := []byte(`{"type":"Feature","id":"station","geometry":{"type":"Point","coordinates":[103.8198,1.3521,12.5]},"properties":{"name":"Station","jsonfg_measures":{"enabled":true,"unit":"m","description":"Distance along platform"},"jsonfg_feature_type":"transit-station","jsonfg_feature_schema":"https://example.test/schemas/station"}}`)
 	var encoded bytes.Buffer

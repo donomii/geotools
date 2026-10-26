@@ -84,6 +84,57 @@ func TestGeoParquetWritesTypedPropertyColumns(t *testing.T) {
 	}
 }
 
+func TestGeoParquetPreservesIntegerProperties(t *testing.T) {
+	cases := map[string][]string{
+		"signed integers":      {"9007199254740993", "9223372036854775807", "-9223372036854775808"},
+		"oversized integers":   {"18446744073709551615", "-9223372036854775809", "123456789012345678901234567890"},
+		"integer then decimal": {"9007199254740993", "0.5", "9223372036854775807"},
+		"decimal then integer": {"0.5", "-9007199254740993", "-9223372036854775808"},
+		"inexact decimals":     {"9007199254740993e0", "0.1234567890123456789", "9007199254740993.0"},
+		"underflow":            {"1e-400", "1e-1000000", "0.5"},
+		"ordinary decimals":    {"0.1", "0.25"},
+	}
+	for name, values := range cases {
+		t.Run(name, func(t *testing.T) {
+			var input bytes.Buffer
+			for _, value := range values {
+				input.WriteString(`{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{"value":` + value + "}}\n")
+			}
+			var encoded bytes.Buffer
+			if err := encodeGeoParquet(&input, &encoded, geodata.InputAuto); err != nil {
+				t.Fatal(err)
+			}
+			if name == "ordinary decimals" {
+				file, err := parquet.OpenFile(bytes.NewReader(encoded.Bytes()), int64(encoded.Len()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				leaf, exists := file.Schema().Lookup("value")
+				if !exists || leaf.Node.Type().Kind() != parquet.Double {
+					t.Fatal("ordinary decimal properties are not stored as Double")
+				}
+			}
+			var output bytes.Buffer
+			if err := decodeGeoParquet(bytes.NewReader(encoded.Bytes()), &output, geodata.OutputCollection); err != nil {
+				t.Fatal(err)
+			}
+			features := collectGeoParquetFeaturesForTest(t, output.Bytes())
+			if len(features) != len(values) {
+				t.Fatalf("decoded %d Features; expected %d", len(features), len(values))
+			}
+			for index, feature := range features {
+				properties, err := feature.PropertyMap()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(properties["value"]) != values[index] {
+					t.Fatalf("property %s decoded as %s", values[index], properties["value"])
+				}
+			}
+		})
+	}
+}
+
 func TestGeoParquetStreamingWKBUsesBoundedSchemaAndRoundTrips(t *testing.T) {
 	input := []byte(`{"type":"FeatureCollection","features":[{"type":"Feature","id":"two","geometry":{"type":"Point","coordinates":[1,2]},"properties":{"name":"first","nullable":null}},{"type":"Feature","id":"three","geometry":{"type":"LineString","coordinates":[[3,4,5],[6,7,8]]},"properties":{"name":"second","late":{"rank":2}}},{"type":"Feature","id":"none","geometry":null,"properties":{}}]}`)
 	settings := geoParquetEncodeSettings{
@@ -453,6 +504,26 @@ func TestGeoParquetThreeDimensionalProjectedRoundTrip(t *testing.T) {
 	}
 	if math.Abs(geometry.Coordinates[0]-103.8198) > 1e-9 || math.Abs(geometry.Coordinates[1]-1.3521) > 1e-9 || geometry.Coordinates[2] != 12.5 {
 		t.Fatalf("3D projected round trip returned coordinates %v", geometry.Coordinates)
+	}
+}
+
+func TestGeoParquetThreeDimensionalGeographicCRSRoundTrip(t *testing.T) {
+	input := []byte(`{"type":"Feature","geometry":{"type":"Point","coordinates":[103.8198,1.3521,12]},"properties":{}}`)
+	for _, crs := range []string{geodata.CRSCRS84h, geodata.CRSEPSG4979} {
+		t.Run(crs, func(t *testing.T) {
+			var encoded bytes.Buffer
+			settings := geoParquetEncodeSettings{InputMode: geodata.InputAuto, CRS: crs, GeometryEncoding: "wkb"}
+			if err := encodeGeoParquetWithSettings(bytes.NewReader(input), &encoded, settings); err != nil {
+				t.Fatal(err)
+			}
+			var output bytes.Buffer
+			if err := decodeGeoParquet(bytes.NewReader(encoded.Bytes()), &output, geodata.OutputCollection); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(sortedFeatureJSON(t, input), sortedFeatureJSON(t, output.Bytes())) {
+				t.Fatalf("%s round trip changed Feature content: %s", crs, output.Bytes())
+			}
+		})
 	}
 }
 

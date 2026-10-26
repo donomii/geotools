@@ -190,3 +190,94 @@ func TestFilterMatchesJSONObjectsRegardlessOfMemberOrder(t *testing.T) {
 		t.Fatal("object-valued condition did not match equivalent JSON with a different member order")
 	}
 }
+
+func TestFilterBBoxUsesGeometryIntersection(t *testing.T) {
+	box := [4]float64{1, 1, 2, 2}
+	wrapped := [4]float64{170, -10, -170, 10}
+	tests := []struct {
+		name     string
+		geometry string
+		bounds   [4]float64
+		matches  bool
+	}{
+		{"diagonal misses box", `{"type":"LineString","coordinates":[[0,0],[4,1]]}`, box, false},
+		{"line crosses box", `{"type":"LineString","coordinates":[[0,1.5],[3,1.5]]}`, box, true},
+		{"line touches corner", `{"type":"LineString","coordinates":[[0,2],[2,0]]}`, box, true},
+		{"line follows edge", `{"type":"LineString","coordinates":[[0,1],[3,1]]}`, box, true},
+		{"multipoint gap", `{"type":"MultiPoint","coordinates":[[0,0],[3,3]]}`, box, false},
+		{"multipoint match", `{"type":"MultiPoint","coordinates":[[0,0],[1,1]]}`, box, true},
+		{"multiline gap", `{"type":"MultiLineString","coordinates":[[[0,0],[0,3]],[[3,0],[3,3]]]}`, box, false},
+		{"multiline match", `{"type":"MultiLineString","coordinates":[[[0,0],[0,3]],[[0,1.5],[3,1.5]]]}`, box, true},
+		{"polygon contains box", `{"type":"Polygon","coordinates":[[[0,0],[3,0],[3,3],[0,3],[0,0]]]}`, box, true},
+		{"box contains polygon", `{"type":"Polygon","coordinates":[[[1.2,1.2],[1.8,1.2],[1.8,1.8],[1.2,1.8],[1.2,1.2]]]}`, box, true},
+		{"polygon envelope overlap only", `{"type":"Polygon","coordinates":[[[0,0],[4,0],[0,1.1],[0,0]]]}`, box, false},
+		{"box inside hole", `{"type":"Polygon","coordinates":[[[0,0],[3,0],[3,3],[0,3],[0,0]],[[0.5,0.5],[0.5,2.5],[2.5,2.5],[2.5,0.5],[0.5,0.5]]]}`, box, false},
+		{"box touches hole edge", `{"type":"Polygon","coordinates":[[[0,0],[3,0],[3,3],[0,3],[0,0]],[[1,0.5],[1,2.5],[2.5,2.5],[2.5,0.5],[1,0.5]]]}`, box, true},
+		{"polygon touches corner", `{"type":"Polygon","coordinates":[[[2,2],[3,2],[3,3],[2,3],[2,2]]]}`, box, true},
+		{"multipolygon gap", `{"type":"MultiPolygon","coordinates":[[[[0,0],[0.5,0],[0.5,3],[0,3],[0,0]]],[[[2.5,0],[3,0],[3,3],[2.5,3],[2.5,0]]]]}`, box, false},
+		{"multipolygon match", `{"type":"MultiPolygon","coordinates":[[[[0,0],[0.5,0],[0.5,3],[0,3],[0,0]]],[[[1.5,0],[3,0],[3,3],[1.5,3],[1.5,0]]]]}`, box, true},
+		{"collection gap", `{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[0,0]},{"type":"Point","coordinates":[3,3]}]}`, box, false},
+		{"nested collection match", `{"type":"GeometryCollection","geometries":[{"type":"GeometryCollection","geometries":[{"type":"LineString","coordinates":[[0,1.5],[3,1.5]]}]}]}`, box, true},
+		{"wrapped east match", `{"type":"LineString","coordinates":[[160,0],[175,0]]}`, wrapped, true},
+		{"wrapped west match", `{"type":"LineString","coordinates":[[-160,0],[-175,0]]}`, wrapped, true},
+		{"wrapped envelope overlap only", `{"type":"LineString","coordinates":[[160,0],[175,40]]}`, wrapped, false},
+		{"wrapped center excluded", `{"type":"Polygon","coordinates":[[[-5,-5],[5,-5],[5,5],[-5,5],[-5,-5]]]}`, wrapped, false},
+		{"point box on line", `{"type":"LineString","coordinates":[[0,0],[3,3]]}`, [4]float64{1, 1, 1, 1}, true},
+		{"point box in polygon", `{"type":"Polygon","coordinates":[[[0,0],[3,0],[3,3],[0,3],[0,0]]]}`, [4]float64{1, 1, 1, 1}, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := bytes.NewBufferString(`{"type":"Feature","geometry":` + test.geometry + `,"properties":{}}`)
+			var output bytes.Buffer
+			settings := filterSettings{BBox: test.bounds, HasBBox: true, Limit: -1}
+			if err := filterGeoJSON(geodata.InputAuto, geodata.OutputJSONL, settings, input, &output); err != nil {
+				t.Fatal(err)
+			}
+			if got := output.Len() > 0; got != test.matches {
+				t.Fatalf("geometry matched bbox %v: got %t, expected %t; output %s", test.bounds, got, test.matches, &output)
+			}
+		})
+	}
+}
+
+func TestFilterLimitDoesNotDecodeFollowingRecord(t *testing.T) {
+	feature := `{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`
+	for _, input := range []string{
+		feature + "\ninvalid JSON",
+		"[" + feature + ",invalid JSON",
+		`{"type":"FeatureCollection","features":[` + feature + ",invalid JSON",
+		"\x1e" + feature + "\n\x1einvalid JSON",
+	} {
+		var output bytes.Buffer
+		if err := filterGeoJSON(geodata.InputAuto, geodata.OutputCollection, filterSettings{Limit: 1}, bytes.NewBufferString(input), &output); err != nil {
+			t.Fatalf("filter continued beyond its limit for input %q: %v", input, err)
+		}
+		count := 0
+		if err := geodata.ReadFeatures(&output, geodata.InputAuto, func(feature geodata.Feature) error {
+			count++
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("filter emitted %d Features; expected 1", count)
+		}
+	}
+}
+
+func TestFilterZeroLimitDoesNotReadInput(t *testing.T) {
+	for _, outputMode := range []geodata.OutputMode{geodata.OutputJSONL, geodata.OutputCollection, geodata.OutputSequence} {
+		input := bytes.NewBufferString("invalid JSON")
+		originalLength := input.Len()
+		var output bytes.Buffer
+		if err := filterGeoJSON(geodata.InputAuto, outputMode, filterSettings{Limit: 0}, input, &output); err != nil {
+			t.Fatal(err)
+		}
+		if input.Len() != originalLength {
+			t.Fatalf("zero limit read %d input bytes", originalLength-input.Len())
+		}
+		if outputMode == geodata.OutputCollection && !json.Valid(output.Bytes()) {
+			t.Fatalf("zero limit left an invalid FeatureCollection: %s", &output)
+		}
+	}
+}

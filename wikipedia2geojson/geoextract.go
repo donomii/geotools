@@ -15,11 +15,14 @@ import (
 	"log"
 	"math"
 	"os"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/donomii/geotools/wikidump"
 	"github.com/dustin/go-humanize"
 	"github.com/dustin/go-wikiparse"
 )
@@ -29,6 +32,9 @@ var numWorkers int
 var strict bool
 
 const wikiResultWindow = 1000
+
+var wikiCoordinatePattern = regexp.MustCompile(`(?is)\{\{\s*coord\s*\|([^}]*)\}\}`)
+var wikiCoordinateIgnoredTextPattern = regexp.MustCompile(`(?is)<!--.*?-->|<nowiki\b[^>]*?/\s*>|<nowiki\b[^>]*>.*?</nowiki\s*>`)
 
 type wikiGeometry struct {
 	Type        string    `json:"type"`
@@ -59,7 +65,7 @@ func parsePageCoords(page *wikiparse.Page) (*wikiFeature, bool, error) {
 	if len(page.Revisions) == 0 {
 		return nil, false, fmt.Errorf("page %q (%d) has no revisions", page.Title, page.ID)
 	}
-	location, err := wikiparse.ParseCoords(page.Revisions[0].Text)
+	location, err := parseWikipediaCoordinates(page.Revisions[0].Text)
 	if err == wikiparse.ErrNoCoordFound {
 		return nil, false, nil
 	} else if err != nil {
@@ -73,6 +79,67 @@ func parsePageCoords(page *wikiparse.Page) (*wikiFeature, bool, error) {
 		Geometry:   wikiGeometry{Type: "Point", Coordinates: []float64{location.Lon, location.Lat}},
 		Properties: wikiProperties{Name: page.Title},
 	}, true, nil
+}
+
+func parseWikipediaCoordinates(text string) (wikiparse.Coord, error) {
+	visibleText := wikiCoordinateIgnoredTextPattern.ReplaceAllString(text, "")
+	match := wikiCoordinatePattern.FindStringSubmatch(visibleText)
+	if match == nil {
+		return wikiparse.Coord{}, wikiparse.ErrNoCoordFound
+	}
+	parts := make([]string, 0)
+	for _, part := range strings.Split(match[1], "|") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "=") || isCoordinateMetadata(part) {
+			if len(parts) > 0 {
+				break
+			}
+			continue
+		}
+		parts = append(parts, part)
+	}
+	if err := validateCoordinateParts(parts); err != nil {
+		return wikiparse.Coord{}, fmt.Errorf("coordinate template %q is invalid: %w", match[0], err)
+	}
+	return wikiparse.ParseCoords("{{coord|" + strings.Join(parts, "|") + "}}")
+}
+
+func isCoordinateMetadata(part string) bool {
+	key, _, exists := strings.Cut(part, ":")
+	if !exists {
+		return false
+	}
+	switch key {
+	case "type", "region", "scale", "dim", "globe", "source":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateCoordinateParts(parts []string) error {
+	numbers := parts
+	if len(parts) != 2 {
+		if len(parts) != 4 && len(parts) != 6 && len(parts) != 8 {
+			return fmt.Errorf("received %d coordinate fields; expected latitude and longitude in decimal, degrees, minutes, or seconds form", len(parts))
+		}
+		latitudeDirectionIndex := len(parts)/2 - 1
+		latitudeDirection := parts[latitudeDirectionIndex]
+		longitudeDirection := parts[len(parts)-1]
+		if (latitudeDirection != "N" && latitudeDirection != "S") || (longitudeDirection != "E" && longitudeDirection != "W") {
+			return fmt.Errorf("expected latitude N/S and longitude E/W directions, received %q and %q", latitudeDirection, longitudeDirection)
+		}
+		numbers = append(append([]string(nil), parts[:latitudeDirectionIndex]...), parts[latitudeDirectionIndex+1:len(parts)-1]...)
+	}
+	for _, number := range numbers {
+		if _, err := strconv.ParseFloat(number, 64); err != nil {
+			return fmt.Errorf("coordinate value %q is not a number: %w", number, err)
+		}
+	}
+	return nil
 }
 
 func pageHandler(tasks <-chan wikiPageTask, results chan<- wikiPageResult, errorPages chan<- *wikiparse.Page, workerGroup *sync.WaitGroup) {
@@ -311,7 +378,7 @@ func processSingleStream(filename string) error {
 	if err != nil {
 		return err
 	}
-	p, err := wikiparse.NewParser(input)
+	p, err := wikidump.NewParser(input)
 	if err != nil {
 		return errors.Join(fmt.Errorf("failed to set up Wikipedia parser for %q: %w", filename, err), input.Close())
 	}
@@ -319,7 +386,7 @@ func processSingleStream(filename string) error {
 }
 
 func processMultiStream(idx, data string) error {
-	p, err := wikiparse.NewIndexedParser(idx, data, runtime.GOMAXPROCS(0))
+	p, err := wikidump.NewIndexedParser(idx, data, runtime.GOMAXPROCS(0))
 	if err != nil {
 		return fmt.Errorf("failed to initialize Wikipedia multistream parser for index %q and data %q: %w", idx, data, err)
 	}
